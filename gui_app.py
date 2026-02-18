@@ -27,6 +27,7 @@ class FaceIdGui(tk.Tk):
         self.threshold_var = tk.StringVar(value="0.72")
         self.db_path_var = tk.StringVar(value="artifacts/faceid_identities.db")
         self.weights_path_var = tk.StringVar(value="")
+        self.anti_spoof_model_path_var = tk.StringVar(value="artifacts/anti_spoof_model.pt")
         self.camera_index_var = tk.StringVar(value="0")
         self.device_var = tk.StringVar(value="")
 
@@ -43,6 +44,8 @@ class FaceIdGui(tk.Tk):
         self.passive_residual_var = tk.StringVar(value="0.24")
         self.passive_texture_var = tk.StringVar(value="45")
         self.passive_max_jitter_var = tk.StringVar(value="8")
+        self.anti_spoof_enabled_var = tk.BooleanVar(value=True)
+        self.anti_spoof_threshold_var = tk.StringVar(value="0.80")
         self.telegram_enabled_var = tk.BooleanVar(value=False)
         self.telegram_bot_token_var = tk.StringVar(value="")
         self.telegram_chat_id_var = tk.StringVar(value="")
@@ -67,15 +70,35 @@ class FaceIdGui(tk.Tk):
         style = ttk.Style(self)
         style.theme_use("clam")
         style.configure("Card.TFrame", background="#ffffff")
-        style.configure("Header.TLabel", background="#f2f4f7", foreground="#111827")
-        style.configure("Title.TLabel", background="#f2f4f7", foreground="#111827")
-        style.configure("SubTitle.TLabel", background="#f2f4f7", foreground="#4b5563")
+        style.configure("Header.TLabel", background="#eef2ff", foreground="#0f172a")
+        style.configure("Title.TLabel", background="#eef2ff", foreground="#0f172a")
+        style.configure("SubTitle.TLabel", background="#eef2ff", foreground="#334155")
         style.configure("Status.TLabel", background="#111827", foreground="#ffffff")
         style.configure("Field.TLabel", background="#ffffff", foreground="#374151")
 
     def _build_ui(self) -> None:
-        root = ttk.Frame(self, padding=14)
-        root.pack(fill=tk.BOTH, expand=True)
+        shell = ttk.Frame(self, padding=10)
+        shell.pack(fill=tk.BOTH, expand=True)
+
+        self._scroll_canvas = tk.Canvas(
+            shell,
+            bg="#eef2ff",
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        v_scroll = ttk.Scrollbar(shell, orient=tk.VERTICAL, command=self._scroll_canvas.yview)
+        self._scroll_canvas.configure(yscrollcommand=v_scroll.set)
+
+        v_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self._scroll_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        root = ttk.Frame(self._scroll_canvas, padding=10)
+        self._canvas_window = self._scroll_canvas.create_window((0, 0), window=root, anchor="nw")
+        root.bind("<Configure>", self._on_root_configure)
+        self._scroll_canvas.bind("<Configure>", self._on_canvas_configure)
+        self.bind_all("<MouseWheel>", self._on_mousewheel, add="+")
+        self.bind_all("<Button-4>", self._on_mousewheel_linux, add="+")
+        self.bind_all("<Button-5>", self._on_mousewheel_linux, add="+")
 
         header = ttk.Frame(root)
         header.pack(fill=tk.X, pady=(0, 10))
@@ -91,6 +114,12 @@ class FaceIdGui(tk.Tk):
             style="SubTitle.TLabel",
             font=("Segoe UI", 10),
         ).pack(anchor="w", pady=(2, 0))
+        ttk.Label(
+            header,
+            text="Tip: use mouse wheel to scroll all settings",
+            style="SubTitle.TLabel",
+            font=("Segoe UI", 9),
+        ).pack(anchor="w", pady=(1, 0))
 
         top = ttk.Frame(root, style="Card.TFrame", padding=12)
         top.pack(fill=tk.X)
@@ -166,6 +195,33 @@ class FaceIdGui(tk.Tk):
         self.events_tree.configure(yscrollcommand=tree_scroll.set)
         tree_scroll.grid(row=0, column=1, sticky="ns")
 
+    def _on_root_configure(self, event: tk.Event) -> None:
+        self._scroll_canvas.configure(scrollregion=self._scroll_canvas.bbox("all"))
+
+    def _on_canvas_configure(self, event: tk.Event) -> None:
+        self._scroll_canvas.itemconfigure(self._canvas_window, width=event.width)
+
+    def _on_mousewheel(self, event: tk.Event) -> None:
+        widget = event.widget
+        if widget is not None:
+            widget_class = str(widget.winfo_class())
+            if widget_class in {"Text", "Treeview", "Entry", "TEntry", "Combobox", "TCombobox"}:
+                return
+        delta = int(-event.delta / 120) if event.delta else 0
+        if delta != 0:
+            self._scroll_canvas.yview_scroll(delta, "units")
+
+    def _on_mousewheel_linux(self, event: tk.Event) -> None:
+        widget = event.widget
+        if widget is not None:
+            widget_class = str(widget.winfo_class())
+            if widget_class in {"Text", "Treeview", "Entry", "TEntry", "Combobox", "TCombobox"}:
+                return
+        if event.num == 4:
+            self._scroll_canvas.yview_scroll(-1, "units")
+        elif event.num == 5:
+            self._scroll_canvas.yview_scroll(1, "units")
+
     def _build_common_section(self, parent: ttk.Frame) -> None:
         common = ttk.LabelFrame(parent, text="Environment", padding=10)
         common.pack(fill=tk.X)
@@ -174,7 +230,14 @@ class FaceIdGui(tk.Tk):
         self._field(common, 0, "Camera Index", self.camera_index_var)
         self._field(common, 1, "Database Path", self.db_path_var)
         self._field(common, 2, "Weights Path (.pt)", self.weights_path_var, browse=True)
-        self._field(common, 3, "Device (cpu/cuda)", self.device_var)
+        self._field(
+            common,
+            3,
+            "Anti-Spoof Model (.pt)",
+            self.anti_spoof_model_path_var,
+            browse=True,
+        )
+        self._field(common, 4, "Device (cpu/cuda)", self.device_var)
 
     def _build_actions(self, parent: ttk.Frame) -> None:
         actions = ttk.Frame(parent)
@@ -224,9 +287,13 @@ class FaceIdGui(tk.Tk):
         ttk.Checkbutton(parent, text="Show Score", variable=self.show_score_var).grid(
             row=4, column=1, sticky="w", pady=4
         )
+        ttk.Checkbutton(parent, text="Enable Anti-Spoof Model", variable=self.anti_spoof_enabled_var).grid(
+            row=5, column=0, columnspan=2, sticky="w", pady=4
+        )
+        self._field(parent, 6, "Anti-Spoof Threshold", self.anti_spoof_threshold_var)
 
         fast_frame = ttk.LabelFrame(parent, text="Fast Anti-Spoof", padding=8)
-        fast_frame.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        fast_frame.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         fast_frame.grid_columnconfigure(1, weight=1)
         self._field(fast_frame, 0, "Window (sec)", self.fast_window_var)
         self._field(fast_frame, 1, "Face Jitter (px)", self.fast_face_jitter_var)
@@ -238,14 +305,14 @@ class FaceIdGui(tk.Tk):
         ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         passive_frame = ttk.LabelFrame(parent, text="Passive Anti-Spoof", padding=8)
-        passive_frame.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        passive_frame.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         passive_frame.grid_columnconfigure(1, weight=1)
         self._field(passive_frame, 0, "Residual Flow", self.passive_residual_var)
         self._field(passive_frame, 1, "Min Texture", self.passive_texture_var)
         self._field(passive_frame, 2, "Max Face Jitter (px)", self.passive_max_jitter_var)
 
         tg_frame = ttk.LabelFrame(parent, text="Telegram Alerts", padding=8)
-        tg_frame.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        tg_frame.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         tg_frame.grid_columnconfigure(1, weight=1)
         ttk.Checkbutton(tg_frame, text="Enable Telegram Alerts", variable=self.telegram_enabled_var).grid(
             row=0, column=0, columnspan=2, sticky="w", pady=(0, 4)
@@ -370,6 +437,7 @@ class FaceIdGui(tk.Tk):
             passive_residual = float(self.passive_residual_var.get().strip())
             passive_texture = float(self.passive_texture_var.get().strip())
             passive_max_jitter = float(self.passive_max_jitter_var.get().strip())
+            anti_spoof_threshold = float(self.anti_spoof_threshold_var.get().strip())
             telegram_fail_threshold = int(self.telegram_fail_threshold_var.get().strip())
             telegram_window = float(self.telegram_window_var.get().strip())
             telegram_alert_cooldown = float(self.telegram_alert_cooldown_var.get().strip())
@@ -381,6 +449,25 @@ class FaceIdGui(tk.Tk):
             return
 
         cmd.extend(["verify", "--threshold", str(threshold)])
+        anti_spoof_model_raw = self.anti_spoof_model_path_var.get().strip()
+        anti_spoof_enabled = self.anti_spoof_enabled_var.get()
+        if anti_spoof_enabled and anti_spoof_model_raw:
+            if not Path(anti_spoof_model_raw).exists():
+                messagebox.showwarning(
+                    "Anti-Spoof Model Missing",
+                    "Anti-spoof model file not found.\n"
+                    "Verification will start without anti-spoof model.",
+                )
+                anti_spoof_enabled = False
+        elif anti_spoof_enabled and not anti_spoof_model_raw:
+            messagebox.showwarning(
+                "Anti-Spoof Path Empty",
+                "Anti-spoof model path is empty.\n"
+                "Verification will start without anti-spoof model.",
+            )
+            anti_spoof_enabled = False
+        if anti_spoof_model_raw:
+            cmd.extend(["--anti-spoof-model-path", anti_spoof_model_raw])
         if self.show_score_var.get():
             cmd.append("--show-score")
         cmd.extend(["--event-ttl-days", str(event_ttl_days)])
@@ -391,6 +478,8 @@ class FaceIdGui(tk.Tk):
             cmd.extend(["--liveness-mode", self.liveness_mode_var.get()])
         else:
             cmd.append("--no-liveness")
+        cmd.append("--anti-spoof" if anti_spoof_enabled else "--no-anti-spoof")
+        cmd.extend(["--anti-spoof-threshold", str(anti_spoof_threshold)])
 
         cmd.extend(["--fast-window-sec", str(fast_window)])
         cmd.extend(["--fast-face-jitter-px", str(fast_face_jitter)])
@@ -508,6 +597,9 @@ class FaceIdGui(tk.Tk):
     def _on_close(self) -> None:
         if self.proc is not None:
             self.proc.terminate()
+        self.unbind_all("<MouseWheel>")
+        self.unbind_all("<Button-4>")
+        self.unbind_all("<Button-5>")
         self.destroy()
 
     def _refresh_events(self) -> None:

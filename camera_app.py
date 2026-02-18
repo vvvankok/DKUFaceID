@@ -96,6 +96,42 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable active liveness challenge before identity verification.",
     )
     verify.add_argument(
+        "--anti-spoof",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable pretrained anti-spoof model before FaceID matching.",
+    )
+    verify.add_argument(
+        "--anti-spoof-model-path",
+        type=Path,
+        default=Path("artifacts/anti_spoof_model.pt"),
+        help="Path to pretrained anti-spoof TorchScript model (.pt).",
+    )
+    verify.add_argument(
+        "--anti-spoof-threshold",
+        type=float,
+        default=0.80,
+        help="Live confidence threshold for anti-spoof decision.",
+    )
+    verify.add_argument(
+        "--anti-spoof-input-size",
+        type=int,
+        default=128,
+        help="Input size for anti-spoof model preprocessing.",
+    )
+    verify.add_argument(
+        "--anti-spoof-margin-ratio",
+        type=float,
+        default=0.20,
+        help="Extra crop margin around detected face for anti-spoof inference.",
+    )
+    verify.add_argument(
+        "--anti-spoof-min-interval-sec",
+        type=float,
+        default=0.10,
+        help="Minimum interval between anti-spoof inferences for CPU efficiency.",
+    )
+    verify.add_argument(
         "--liveness-mode",
         type=str,
         choices=["passive", "fast", "motion", "blink"],
@@ -687,6 +723,7 @@ def start_telegram_callback_worker(
 
 def run_verify(args: argparse.Namespace) -> None:
     import cv2
+    from anti_spoof import AntiSpoofModel
     from src.faceid.embedding import FaceEmbedder
 
     identities = load_identities(args.db_path)
@@ -700,6 +737,31 @@ def run_verify(args: argparse.Namespace) -> None:
         raise RuntimeError(f"Cannot open camera index {args.camera_index}")
 
     embedder = FaceEmbedder(device=args.device, weights_path=args.weights_path)
+    anti_spoof: AntiSpoofModel | None = None
+    if args.anti_spoof:
+        anti_spoof_device = args.device if args.device else "cpu"
+        try:
+            anti_spoof = AntiSpoofModel(
+                model_path=args.anti_spoof_model_path,
+                threshold=args.anti_spoof_threshold,
+                device=anti_spoof_device,
+                input_size=args.anti_spoof_input_size,
+                margin_ratio=args.anti_spoof_margin_ratio,
+                min_interval_sec=args.anti_spoof_min_interval_sec,
+            )
+        except Exception as exc:
+            print(
+                "Anti-spoof initialization failed, fallback to built-in liveness. "
+                "Check --anti-spoof-model-path and model format (.pt TorchScript). "
+                f"Details: {exc}"
+            )
+            args.anti_spoof = False
+        else:
+            print(
+                "Anti-spoof enabled: "
+                f"model={args.anti_spoof_model_path} "
+                f"threshold={args.anti_spoof_threshold:.2f}"
+            )
     print("Verification mode started. Press 'q' to quit.")
     if args.event_ttl_days > 0:
         deleted = cleanup_old_events(args.db_path, ttl_days=args.event_ttl_days)
@@ -800,11 +862,31 @@ def run_verify(args: argparse.Namespace) -> None:
             color = (0, 0, 255)
             status_suffix = ""
             now = time.monotonic()
-            liveness_ok = not args.liveness
+            liveness_required = args.liveness or args.anti_spoof
+            liveness_ok = not liveness_required
 
             if box is not None:
                 live_ready = True
-                if args.liveness:
+                anti_spoof_blocked = False
+                if args.anti_spoof and anti_spoof is not None:
+                    try:
+                        anti_spoof_result = anti_spoof.predict(frame, box, now)
+                        if not anti_spoof_result.is_live:
+                            live_ready = False
+                            anti_spoof_blocked = True
+                            status_suffix = (
+                                " | anti-spoof: FAKE "
+                                f"{anti_spoof_result.live_score:.2f}/"
+                                f"{args.anti_spoof_threshold:.2f}"
+                            )
+                            color = (0, 165, 255)
+                    except Exception as exc:
+                        live_ready = False
+                        anti_spoof_blocked = True
+                        status_suffix = f" | anti-spoof error: {exc}"
+                        color = (0, 165, 255)
+
+                if live_ready and args.liveness:
                     live_ready = now <= liveness_ok_until
                     if effective_liveness_mode == "motion":
                         center = face_center(box)
@@ -1019,8 +1101,29 @@ def run_verify(args: argparse.Namespace) -> None:
                     if embedding is not None:
                         name, score = match_identity(embedding, identities, args.threshold)
                         color = (0, 200, 0) if name != "unknown" else (0, 165, 255)
+                        ok_suffix = []
+                        if args.anti_spoof:
+                            ok_suffix.append("anti-spoof OK")
                         if args.liveness:
-                            status_suffix = " | liveness OK"
+                            ok_suffix.append("liveness OK")
+                        if ok_suffix:
+                            status_suffix = " | " + " + ".join(ok_suffix)
+                elif anti_spoof_blocked:
+                    liveness_direction = None
+                    liveness_baseline = None
+                    blink_count = 0
+                    eyes_closed_since = None
+                    long_close_ready = False
+                    passive_prev_gray = None
+                    passive_residual_hist.clear()
+                    passive_texture_hist.clear()
+                    passive_center_hist.clear()
+                    fast_centers.clear()
+                    fast_ears.clear()
+                    fast_blink_count = 0
+                    fast_eye_state = "open"
+                    fast_closed_frames = 0
+                    fast_closed_started_at = None
             else:
                 liveness_direction = None
                 liveness_baseline = None
@@ -1040,7 +1143,7 @@ def run_verify(args: argparse.Namespace) -> None:
 
             decision = make_decision(
                 has_face=box is not None,
-                liveness_required=args.liveness,
+                liveness_required=liveness_required,
                 liveness_ok=liveness_ok,
                 identity=name,
                 score=score,
