@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Sequence, Tuple
 
+import cv2
 import numpy as np
 import torch
 from facenet_pytorch import InceptionResnetV1, MTCNN
@@ -99,6 +100,40 @@ class FaceEmbedder:
             return None
         vector = self._embed_batch(face.unsqueeze(0))[0]
         return vector.astype(np.float32)
+
+    def extract_single_gated(
+        self,
+        image: Image.Image,
+        min_sharpness: float = 55.0,
+        min_brightness: float = 35.0,
+        max_brightness: float = 225.0,
+    ) -> tuple[np.ndarray | None, float]:
+        """
+        Like :meth:`extract_single` but first checks the 160×160 aligned face
+        crop for sharpness and brightness.  Returns ``(embedding, quality)``
+        where *quality* is the Laplacian-variance sharpness score, or
+        ``(None, 0.0)`` when the frame is rejected.
+
+        Quality gate prevents blurry / dark / overexposed frames from
+        poisoning the match decision — same idea used on phones.
+        """
+        face = self.mtcnn(image.convert("RGB"))
+        if face is None:
+            return None, 0.0
+
+        # face tensor is (3, 160, 160) in [-1, 1]; convert to uint8 grayscale
+        face_u8 = ((face.permute(1, 2, 0).numpy() + 1.0) * 127.5).clip(0, 255).astype(np.uint8)
+        gray = cv2.cvtColor(face_u8, cv2.COLOR_RGB2GRAY)
+        sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        brightness = float(gray.mean())
+
+        if sharpness < min_sharpness:
+            return None, sharpness
+        if brightness < min_brightness or brightness > max_brightness:
+            return None, sharpness
+
+        vector = self._embed_batch(face.unsqueeze(0))[0]
+        return vector.astype(np.float32), sharpness
 
     def extract_single_from_bgr(self, frame_bgr: np.ndarray) -> np.ndarray | None:
         rgb = frame_bgr[:, :, ::-1]

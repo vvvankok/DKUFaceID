@@ -107,7 +107,7 @@ def save_embeddings_sqlite(
     for vector, label in zip(embeddings, labels):
         per_label.setdefault(label, []).append(vector)
 
-    conn = sqlite3.connect(db_path)
+    conn = _connect(db_path)
     try:
         ensure_identities_schema(conn)
         conn.execute("DELETE FROM identities")
@@ -143,7 +143,7 @@ def ensure_identities_schema(conn: sqlite3.Connection) -> None:
 def upsert_identity_embedding(db_path: Path, name: str, embedding: np.ndarray) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     vector = normalize_vector(embedding.astype(np.float32))
-    conn = sqlite3.connect(db_path)
+    conn = _connect(db_path)
     try:
         ensure_identities_schema(conn)
         ensure_access_events_schema(conn)
@@ -166,7 +166,7 @@ def upsert_identity_embedding(db_path: Path, name: str, embedding: np.ndarray) -
 def load_identities(db_path: Path) -> list[IdentityRecord]:
     if not db_path.exists():
         return []
-    conn = sqlite3.connect(db_path)
+    conn = _connect(db_path)
     try:
         ensure_identities_schema(conn)
         ensure_access_events_schema(conn)
@@ -196,6 +196,13 @@ def normalize_vector(vector: np.ndarray) -> np.ndarray:
     if norm <= 1e-8:
         return vector.astype(np.float32)
     return (vector / norm).astype(np.float32)
+
+
+def _connect(db_path: Path) -> sqlite3.Connection:
+    """Open a SQLite connection with WAL mode for better concurrent read/write."""
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
 
 
 def ensure_access_events_schema(conn: sqlite3.Connection) -> None:
@@ -233,7 +240,7 @@ def ensure_access_events_schema(conn: sqlite3.Connection) -> None:
 
 def log_access_event(db_path: Path, event: AccessEvent) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path)
+    conn = _connect(db_path)
     try:
         ensure_identities_schema(conn)
         ensure_access_events_schema(conn)
@@ -265,7 +272,7 @@ def cleanup_old_events(db_path: Path, ttl_days: int = 7) -> int:
     if not db_path.exists():
         return 0
     cutoff = datetime.now(timezone.utc) - timedelta(days=ttl_days)
-    conn = sqlite3.connect(db_path)
+    conn = _connect(db_path)
     try:
         ensure_access_events_schema(conn)
         cur = conn.execute(
@@ -291,7 +298,7 @@ def mark_recent_false_incidents(
         return 0
 
     cutoff = datetime.now(timezone.utc) - timedelta(seconds=lookback_sec)
-    conn = sqlite3.connect(db_path)
+    conn = _connect(db_path)
     try:
         ensure_access_events_schema(conn)
         cur = conn.execute(
@@ -326,29 +333,100 @@ def _ensure_column(
         conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {ddl}")
 
 
-def get_attendance_today_utc(db_path: Path) -> list[tuple[str, int]]:
+def get_attendance_today_utc(db_path: Path) -> list[tuple[str, str]]:
+    """
+    Return today's unique visitors as ``(identity, first_entry_time_utc)`` pairs,
+    ordered by arrival time ascending.  Each person appears at most once per
+    calendar day regardless of how many ALLOW events were logged.
+    The time string is formatted as ``"HH:MM"`` in UTC.
+    """
     if not db_path.exists():
         return []
     now = datetime.now(timezone.utc)
     start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     end = start + timedelta(days=1)
 
-    conn = sqlite3.connect(db_path)
+    conn = _connect(db_path)
     try:
         ensure_access_events_schema(conn)
         rows = conn.execute(
             """
-            SELECT identity, COUNT(*) AS cnt
+            SELECT identity, MIN(ts_utc) AS first_entry
             FROM access_events
             WHERE decision = 'ALLOW'
               AND identity NOT IN ('unknown', 'no_face', 'admin_override')
               AND ts_utc >= ?
               AND ts_utc < ?
             GROUP BY identity
-            ORDER BY cnt DESC, identity ASC
+            ORDER BY first_entry ASC
             """,
             (start.isoformat(), end.isoformat()),
         ).fetchall()
-        return [(str(identity), int(cnt)) for identity, cnt in rows]
     finally:
         conn.close()
+
+    result: list[tuple[str, str]] = []
+    for identity, first_entry in rows:
+        try:
+            # ts_utc stored as ISO-8601; extract HH:MM
+            time_str = str(first_entry)[11:16]
+        except Exception:
+            time_str = "—"
+        result.append((str(identity), time_str))
+    return result
+
+
+def backup_db(db_path: Path, backup_path: Path) -> None:
+    """
+    Create a plain (unencrypted) SQLite backup of *db_path* using the
+    built-in streaming backup API.  Safe to call while the DB is in use.
+    Satisfies ТЗ §4.1.4 alt-flow "восстановление из резервной копии".
+    """
+    if not db_path.exists():
+        raise FileNotFoundError(f"Source DB not found: {db_path}")
+    backup_path.parent.mkdir(parents=True, exist_ok=True)
+    src = _connect(db_path)
+    dst = sqlite3.connect(str(backup_path))
+    try:
+        src.backup(dst)
+    finally:
+        src.close()
+        dst.close()
+
+
+def export_events_csv(db_path: Path, csv_path: Path, limit: int = 10_000) -> int:
+    """
+    Export the most recent *limit* access events to a UTF-8 CSV file at
+    *csv_path*.  Returns the number of rows written.
+    Satisfies ТЗ §4.1.6 (ведение журнала событий).
+    """
+    import csv
+
+    if not db_path.exists():
+        return 0
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = _connect(db_path)
+    try:
+        ensure_access_events_schema(conn)
+        rows = conn.execute(
+            """
+            SELECT ts_utc, decision, reason, identity, score,
+                   liveness_ok, source, is_suspicious, is_false_positive
+            FROM access_events
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    headers = [
+        "ts_utc", "decision", "reason", "identity", "score",
+        "liveness_ok", "source", "is_suspicious", "is_false_positive",
+    ]
+    with csv_path.open("w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow(headers)
+        writer.writerows(rows)
+    return len(rows)

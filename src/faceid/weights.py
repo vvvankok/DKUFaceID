@@ -47,7 +47,14 @@ def download_weights(target_path: Path) -> None:
     target_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         _download(VGGFACE2_URL, target_path, insecure=False)
-    except Exception:
+    except Exception as exc:
+        import warnings
+        warnings.warn(
+            f"Secure download failed ({exc}); retrying without SSL verification. "
+            "Ensure you trust the source URL before proceeding.",
+            UserWarning,
+            stacklevel=2,
+        )
         _download(VGGFACE2_URL, target_path, insecure=True)
 
 

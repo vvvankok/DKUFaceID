@@ -8,6 +8,7 @@ from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
+import cv2
 import numpy as np
 from PIL import Image
 
@@ -23,7 +24,8 @@ from src.faceid.modeling import (
     normalize_vector,
     upsert_identity_embedding,
 )
-from src.faceid.alerts import TelegramAlerter
+from src.faceid.alerts import MultiTelegramAlerter, TelegramAlerter
+from src.faceid.relay import RelayController
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -274,7 +276,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--telegram-chat-id",
         type=str,
         default="",
-        help="Telegram chat id for alerts.",
+        help="Telegram chat id for alerts (recipient 1).",
+    )
+    verify.add_argument(
+        "--telegram-chat-id2",
+        type=str,
+        default="",
+        help="Second Telegram chat id for alerts (recipient 2, optional).",
     )
     verify.add_argument(
         "--telegram-fail-threshold",
@@ -291,7 +299,7 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument(
         "--telegram-alert-cooldown-sec",
         type=float,
-        default=30.0,
+        default=40.0,
         help="Minimum interval between Telegram alerts.",
     )
     verify.add_argument(
@@ -342,6 +350,30 @@ def build_parser() -> argparse.ArgumentParser:
         default=20,
         help="Lookback window for false-incident marking after ALLOW.",
     )
+    verify.add_argument(
+        "--relay-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Activate relay/door-lock on successful access.",
+    )
+    verify.add_argument(
+        "--relay-pin",
+        type=int,
+        default=18,
+        help="BCM GPIO pin number for the relay (Raspberry Pi only).",
+    )
+    verify.add_argument(
+        "--relay-duration-sec",
+        type=float,
+        default=2.0,
+        help="How many seconds the relay stays open on ALLOW.",
+    )
+    verify.add_argument(
+        "--relay-active-high",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Relay is active HIGH (default) or active LOW.",
+    )
     return parser
 
 
@@ -356,8 +388,6 @@ def draw_box(frame: np.ndarray, box: np.ndarray | None, color: tuple[int, int, i
     y2 = max(0, min(h - 1, y2))
     if x2 <= x1 or y2 <= y1:
         return
-    import cv2
-
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
 
@@ -369,8 +399,6 @@ def largest_box(boxes: np.ndarray | None) -> np.ndarray | None:
 
 
 def put_status(frame: np.ndarray, text: str, color: tuple[int, int, int]) -> None:
-    import cv2
-
     cv2.putText(
         frame,
         text,
@@ -384,7 +412,6 @@ def put_status(frame: np.ndarray, text: str, color: tuple[int, int, int]) -> Non
 
 
 def run_register(args: argparse.Namespace) -> None:
-    import cv2
     from src.faceid.embedding import FaceEmbedder
 
     if args.samples < 1:
@@ -401,11 +428,24 @@ def run_register(args: argparse.Namespace) -> None:
     print("Registration mode started. Press 'q' to quit.")
     print(f"Registering user: {args.name}")
 
+    _cam_fail = 0
+    _CAM_FAIL_MAX = 30
+
     try:
         while True:
             ok, frame = cap.read()
             if not ok:
+                _cam_fail += 1
+                if _cam_fail >= _CAM_FAIL_MAX:
+                    print(f"[camera] read failed {_cam_fail}x, reconnecting index {args.camera_index}...")
+                    cap.release()
+                    time.sleep(1.0)
+                    cap = cv2.VideoCapture(args.camera_index)
+                    _cam_fail = 0
+                    if not cap.isOpened():
+                        print("[camera] reconnect failed, will retry...")
                 continue
+            _cam_fail = 0
 
             pil = Image.fromarray(frame[:, :, ::-1])
             boxes = embedder.detect_boxes(pil)
@@ -415,16 +455,20 @@ def run_register(args: argparse.Namespace) -> None:
             now = time.monotonic()
             has_face = box is not None
             ready = now - last_capture_at >= args.capture_interval_sec
+            quality_note = ""
             if has_face and ready and len(captured) < args.samples:
-                embedding = embedder.extract_single(pil)
+                embedding, quality = embedder.extract_single_gated(pil)
                 if embedding is not None:
                     captured.append(embedding)
                     last_capture_at = now
+                elif quality > 0:
+                    quality_note = f" LOW SHARPNESS({quality:.0f})"
 
+            status_color = (0, 255, 255) if not quality_note else (0, 165, 255)
             put_status(
                 frame,
-                f"Register {args.name}: {len(captured)}/{args.samples}",
-                (0, 255, 255),
+                f"Register {args.name}: {len(captured)}/{args.samples}{quality_note}",
+                status_color,
             )
             cv2.imshow("FaceID Register", frame)
 
@@ -448,16 +492,16 @@ def run_register(args: argparse.Namespace) -> None:
 def match_identity(
     embedding: np.ndarray, identities: list[IdentityRecord], threshold: float
 ) -> tuple[str, float]:
-    best_name = "unknown"
-    best_score = -1.0
-    for identity in identities:
-        score = cosine_similarity(embedding, identity.embedding)
-        if score > best_score:
-            best_name = identity.name
-            best_score = score
+    if not identities:
+        return "unknown", -1.0
+    # Batch cosine similarity via matrix multiply (all embeddings are pre-normalised).
+    matrix = np.stack([r.embedding for r in identities], axis=0)  # (N, D)
+    scores = matrix @ embedding  # equivalent to cosine sim for unit vectors
+    best_idx = int(np.argmax(scores))
+    best_score = float(scores[best_idx])
     if best_score < threshold:
         return "unknown", best_score
-    return best_name, best_score
+    return identities[best_idx].name, best_score
 
 
 @dataclass(frozen=True)
@@ -576,16 +620,7 @@ def get_blink_ear(frame: np.ndarray, face_mesh: object) -> float | None:
 
 
 def trim_history(
-    history: deque[tuple[float, float]],
-    now: float,
-    window_sec: float,
-) -> None:
-    while history and (now - history[0][0]) > window_sec:
-        history.popleft()
-
-
-def trim_center_history(
-    history: deque[tuple[float, float, float]],
+    history: deque,
     now: float,
     window_sec: float,
 ) -> None:
@@ -594,8 +629,6 @@ def trim_center_history(
 
 
 def crop_face_gray(frame: np.ndarray, box: np.ndarray, size: int = 96) -> np.ndarray | None:
-    import cv2
-
     h, w = frame.shape[:2]
     x1, y1, x2, y2 = [int(v) for v in box]
     x1 = max(0, min(w - 1, x1))
@@ -613,8 +646,6 @@ def crop_face_gray(frame: np.ndarray, box: np.ndarray, size: int = 96) -> np.nda
 
 
 def passive_flow_metrics(prev_gray: np.ndarray, curr_gray: np.ndarray) -> tuple[float, float]:
-    import cv2
-
     flow = cv2.calcOpticalFlowFarneback(
         prev_gray,
         curr_gray,
@@ -640,8 +671,6 @@ def passive_flow_metrics(prev_gray: np.ndarray, curr_gray: np.ndarray) -> tuple[
 def encode_alert_photo(
     frame: np.ndarray, box: np.ndarray | None, decision_text: str
 ) -> bytes | None:
-    import cv2
-
     annotated = frame.copy()
     if box is not None:
         x1, y1, x2, y2 = [int(v) for v in box]
@@ -669,14 +698,72 @@ def start_telegram_callback_worker(
     allow_sec: float,
     db_path: Path,
 ) -> threading.Thread:
-    def attendance_message() -> str:
+    import datetime
+
+    def attendance_html() -> str:
         rows = get_attendance_today_utc(db_path)
+        today = datetime.datetime.now().strftime("%d.%m.%Y")
         if not rows:
-            return "Attendance today: empty."
-        lines = ["Attendance today:"]
-        for name, _cnt in rows:
-            lines.append(name)
+            return f"<b>Посещаемость {today}</b>\n\nНикто не приходил."
+        lines = [f"<b>Посещаемость за {today}</b>  ({len(rows)} чел.)\n"]
+        for name, first_time in rows:
+            lines.append(f"  &#9989; <b>{name}</b> — вошёл в {first_time} UTC")
         return "\n".join(lines)
+
+    def stats_html() -> str:
+        if not db_path.exists():
+            return "<b>Статистика</b>\n\nБаза данных не найдена."
+        import sqlite3 as _sq
+        conn = _sq.connect(str(db_path))
+        try:
+            today = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+            row = conn.execute(
+                """SELECT
+                    SUM(decision='ALLOW') AS ok,
+                    SUM(decision LIKE 'DENY%') AS denied,
+                    SUM(is_suspicious) AS sus
+                   FROM access_events WHERE ts_utc >= ?""",
+                (today,),
+            ).fetchone()
+        finally:
+            conn.close()
+        ok, denied, sus = (int(v or 0) for v in (row or (0, 0, 0)))
+        total = ok + denied
+        return (
+            f"<b>Статистика за сегодня</b>\n\n"
+            f"&#9989; Разрешено: <b>{ok}</b>\n"
+            f"&#10060; Отказов: <b>{denied}</b>\n"
+            f"&#128683; Подозрительных: <b>{sus}</b>\n"
+            f"&#128202; Всего событий: <b>{total}</b>"
+        )
+
+    def users_html() -> str:
+        if not db_path.exists():
+            return "<b>Пользователи</b>\n\nБаза данных не найдена."
+        import sqlite3 as _sq
+        conn = _sq.connect(str(db_path))
+        try:
+            rows = conn.execute(
+                "SELECT name, updated_at FROM identities ORDER BY name"
+            ).fetchall()
+        finally:
+            conn.close()
+        if not rows:
+            return "<b>Зарегистрированные пользователи</b>\n\nСписок пуст."
+        lines = [f"<b>Зарегистрированные пользователи</b> ({len(rows)}):\n"]
+        for name, updated_at in rows:
+            date = str(updated_at)[:10] if updated_at else "—"
+            lines.append(f"  &#128100; <b>{name}</b>  <i>({date})</i>")
+        return "\n".join(lines)
+
+    HELP_TEXT = (
+        "<b>FaceID — доступные команды</b>\n\n"
+        "/help — эта справка\n"
+        "/list — список зарегистрированных пользователей\n"
+        "/stats — статистика за сегодня\n"
+        "/attendance — посещаемость за сегодня\n"
+        "/status — статус системы"
+    )
 
     def worker() -> None:
         offset: int | None = None
@@ -694,9 +781,24 @@ def start_telegram_callback_worker(
                         offset = update_id + 1
 
                     msg = upd.get("message") or {}
-                    text = str(msg.get("text", "")).strip().lower()
-                    if text in {"/attendance", "attendance", "attendance today"}:
-                        telegram.send(attendance_message())
+                    raw_text = str(msg.get("text", "")).strip()
+                    cmd = raw_text.lower().split("@")[0]  # strip @botname suffix
+
+                    if cmd in {"/help", "/команды", "help"}:
+                        telegram.send_html(HELP_TEXT)
+                    elif cmd in {"/list", "/пользователи", "/users"}:
+                        telegram.send_html(users_html())
+                    elif cmd in {"/stats", "/статистика", "/stat"}:
+                        telegram.send_html(stats_html())
+                    elif cmd in {"/attendance", "/посещаемость", "attendance"}:
+                        telegram.send_html(attendance_html())
+                    elif cmd in {"/status", "/статус"}:
+                        now_str = datetime.datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+                        telegram.send_html(
+                            f"<b>Статус системы FaceID</b>\n\n"
+                            f"&#128994; Система активна\n"
+                            f"&#128336; Время: <code>{now_str}</code>"
+                        )
 
                     cb = upd.get("callback_query") or {}
                     data = str(cb.get("data", ""))
@@ -704,15 +806,15 @@ def start_telegram_callback_worker(
                     if data.startswith("faceid:allow"):
                         state["allow_until"] = time.monotonic() + max(1.0, allow_sec)
                         if cb_id:
-                            telegram.answer_callback_query(cb_id, "Access temporarily allowed")
+                            telegram.answer_callback_query(cb_id, "Доступ временно разрешён")
                     elif data.startswith("faceid:deny"):
                         state["allow_until"] = 0.0
                         if cb_id:
-                            telegram.answer_callback_query(cb_id, "Access denied")
+                            telegram.answer_callback_query(cb_id, "Доступ заблокирован")
                     elif data.startswith("faceid:attendance"):
-                        telegram.send(attendance_message())
+                        telegram.send_html(attendance_html())
                         if cb_id:
-                            telegram.answer_callback_query(cb_id, "Attendance sent")
+                            telegram.answer_callback_query(cb_id, "Посещаемость отправлена")
             except Exception:
                 time.sleep(1.0)
 
@@ -722,7 +824,6 @@ def start_telegram_callback_worker(
 
 
 def run_verify(args: argparse.Namespace) -> None:
-    import cv2
     from anti_spoof import AntiSpoofModel
     from src.faceid.embedding import FaceEmbedder
 
@@ -735,6 +836,15 @@ def run_verify(args: argparse.Namespace) -> None:
     cap = cv2.VideoCapture(args.camera_index)
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open camera index {args.camera_index}")
+
+    # Relay / door-lock controller (ТЗ п. 4.1)
+    relay: RelayController | None = None
+    if args.relay_enabled:
+        relay = RelayController(
+            pin=args.relay_pin,
+            active_high=args.relay_active_high,
+            door_open_sec=args.relay_duration_sec,
+        )
 
     embedder = FaceEmbedder(device=args.device, weights_path=args.weights_path)
     anti_spoof: AntiSpoofModel | None = None
@@ -785,6 +895,12 @@ def run_verify(args: argparse.Namespace) -> None:
     passive_residual_hist: deque[tuple[float, float]] = deque()
     passive_texture_hist: deque[tuple[float, float]] = deque()
     passive_center_hist: deque[tuple[float, float, float]] = deque()
+    # ── temporal embedding buffer (smoothing, anti-flicker) ──────────────────
+    # Keep the last N high-quality embeddings and match against their mean.
+    # This is the primary reason phones are more stable than single-frame systems.
+    _EMBED_BUF_SIZE = 6
+    embed_buffer: deque[np.ndarray] = deque(maxlen=_EMBED_BUF_SIZE)
+
     last_logged_key: tuple[str, str, str] | None = None
     last_logged_at = 0.0
     deny_events: deque[float] = deque()
@@ -796,10 +912,12 @@ def run_verify(args: argparse.Namespace) -> None:
     telegram_callback_thread: threading.Thread | None = None
     admin_state: dict[str, float] = {"allow_until": 0.0}
 
-    telegram = TelegramAlerter(
-        bot_token=args.telegram_bot_token.strip(),
-        chat_id=args.telegram_chat_id.strip(),
-    )
+    _token = args.telegram_bot_token.strip()
+    _alerters = [TelegramAlerter(bot_token=_token, chat_id=args.telegram_chat_id.strip())]
+    if getattr(args, "telegram_chat_id2", "").strip():
+        _alerters.append(TelegramAlerter(bot_token=_token, chat_id=args.telegram_chat_id2.strip()))
+        print(f"Telegram: broadcasting to {len(_alerters)} recipients.")
+    telegram = MultiTelegramAlerter(alerters=_alerters)
     if args.telegram_enabled and not telegram.is_configured():
         print("Telegram enabled but token/chat_id are empty. Alerts disabled.")
         args.telegram_enabled = False
@@ -847,11 +965,24 @@ def run_verify(args: argparse.Namespace) -> None:
     ):
         print("Fast blink requirement disabled: face landmarks unavailable.")
 
+    _cam_fail = 0
+    _CAM_FAIL_MAX = 30
+
     try:
         while True:
             ok, frame = cap.read()
             if not ok:
+                _cam_fail += 1
+                if _cam_fail >= _CAM_FAIL_MAX:
+                    print(f"[camera] read failed {_cam_fail}x, reconnecting index {args.camera_index}...")
+                    cap.release()
+                    time.sleep(1.0)
+                    cap = cv2.VideoCapture(args.camera_index)
+                    _cam_fail = 0
+                    if not cap.isOpened():
+                        print("[camera] reconnect failed, will retry...")
                 continue
+            _cam_fail = 0
 
             pil = Image.fromarray(frame[:, :, ::-1])
             boxes = embedder.detect_boxes(pil)
@@ -930,7 +1061,7 @@ def run_verify(args: argparse.Namespace) -> None:
                             else:
                                 cx, cy = face_center(box)
                                 passive_center_hist.append((now, cx, cy))
-                                trim_center_history(passive_center_hist, now, args.passive_window_sec)
+                                trim_history(passive_center_hist, now, args.passive_window_sec)
                                 if passive_prev_gray is not None:
                                     residual, texture = passive_flow_metrics(passive_prev_gray, face_gray)
                                     passive_residual_hist.append((now, residual))
@@ -976,7 +1107,7 @@ def run_verify(args: argparse.Namespace) -> None:
                         if not live_ready:
                             cx, cy = face_center(box)
                             fast_centers.append((now, cx, cy))
-                            trim_center_history(fast_centers, now, args.fast_window_sec)
+                            trim_history(fast_centers, now, args.fast_window_sec)
 
                             ear = None
                             if face_mesh is not None:
@@ -1097,9 +1228,18 @@ def run_verify(args: argparse.Namespace) -> None:
 
                 if live_ready:
                     liveness_ok = True
-                    embedding = embedder.extract_single(pil)
+                    embedding, quality = embedder.extract_single_gated(pil)
                     if embedding is not None:
-                        name, score = match_identity(embedding, identities, args.threshold)
+                        embed_buffer.append(embedding)
+                        # Use mean of buffered embeddings — eliminates single-frame
+                        # noise, mirrors the temporal smoothing used on phones.
+                        if len(embed_buffer) >= 2:
+                            mean_emb = normalize_vector(
+                                np.mean(np.stack(list(embed_buffer), axis=0), axis=0)
+                            )
+                        else:
+                            mean_emb = embedding
+                        name, score = match_identity(mean_emb, identities, args.threshold)
                         color = (0, 200, 0) if name != "unknown" else (0, 165, 255)
                         ok_suffix = []
                         if args.anti_spoof:
@@ -1140,6 +1280,7 @@ def run_verify(args: argparse.Namespace) -> None:
                 fast_eye_state = "open"
                 fast_closed_frames = 0
                 fast_closed_started_at = None
+                embed_buffer.clear()  # reset temporal buffer when face leaves frame
 
             decision = make_decision(
                 has_face=box is not None,
@@ -1223,58 +1364,73 @@ def run_verify(args: argparse.Namespace) -> None:
                 and (now - last_unknown_alert_at) >= args.telegram_unknown_cooldown_sec
             )
 
+            # Activate relay on successful identification (ТЗ п. 4.1)
+            if decision.decision == "ALLOW" and relay is not None:
+                relay.open_door()
+
             if should_alert_unknown:
+                import datetime as _dt
+                ts = _dt.datetime.utcnow().strftime("%H:%M:%S UTC")
+                presence = f"{now - (unknown_started_at or now):.1f}"
                 caption = (
-                    "FaceID unknown person detected\n"
-                    f"score={decision.score:.3f}\n"
-                    f"liveness_ok={liveness_ok}"
+                    f"&#128683; <b>Неизвестный пользователь</b>\n\n"
+                    f"&#8987; Присутствует: <b>{presence}с</b>\n"
+                    f"&#128337; <code>{ts}</code>\n"
+                    f"&#128270; Схожесть: <code>{decision.score:.3f}</code>\n"
+                    f"&#128065; Живость: {'OK' if liveness_ok else 'нет'}"
                 )
                 try:
                     actions = [
-                        ("Allow access", "faceid:allow"),
-                        ("Deny", "faceid:deny"),
+                        ("✅ Разрешить доступ", "faceid:allow"),
+                        ("⛔ Отклонить", "faceid:deny"),
                     ]
                     if args.telegram_send_photo:
                         photo = encode_alert_photo(frame, box, "DENY_UNKNOWN")
                         if photo is not None:
                             if args.telegram_admin_buttons:
                                 telegram.send_photo_with_actions(
-                                    photo, caption=caption, actions=actions
+                                    photo, caption=caption, actions=actions, parse_mode="HTML"
                                 )
                             else:
-                                telegram.send_photo(photo, caption=caption)
+                                telegram.send_photo(photo, caption=caption, parse_mode="HTML")
                         else:
                             if args.telegram_admin_buttons:
-                                telegram.send_with_actions(caption, actions=actions)
+                                telegram.send_with_actions(
+                                    caption, actions=actions, parse_mode="HTML"
+                                )
                             else:
-                                telegram.send(caption)
+                                telegram.send_html(caption)
                     else:
                         if args.telegram_admin_buttons:
-                            telegram.send_with_actions(caption, actions=actions)
+                            telegram.send_with_actions(
+                                caption, actions=actions, parse_mode="HTML"
+                            )
                         else:
-                            telegram.send(caption)
+                            telegram.send_html(caption)
                     last_unknown_alert_at = now
                 except Exception as exc:
                     print(f"Telegram unknown alert failed: {exc}")
 
             if should_alert:
+                import datetime as _dt
+                ts = _dt.datetime.utcnow().strftime("%H:%M:%S UTC")
+                caption = (
+                    f"&#9888; <b>Подозрительная активность</b>\n\n"
+                    f"&#128683; Решение: <code>{decision.decision}</code>\n"
+                    f"&#128100; Идентификатор: <code>{decision.identity}</code>\n"
+                    f"&#128270; Схожесть: <code>{decision.score:.3f}</code>\n"
+                    f"&#128337; <code>{ts}</code>\n"
+                    f"&#128202; Отказов в окне: <b>{len(deny_events)}</b>"
+                )
                 try:
-                    caption = (
-                        "FaceID suspicious activity\n"
-                        f"decision={decision.decision}\n"
-                        f"identity={decision.identity}\n"
-                        f"score={decision.score:.3f}\n"
-                        f"liveness_ok={liveness_ok}\n"
-                        f"fails_in_window={len(deny_events)}"
-                    )
                     if args.telegram_send_photo:
                         photo = encode_alert_photo(frame, box, "SUSPICIOUS_ACTIVITY")
                         if photo is not None:
-                            telegram.send_photo(photo, caption=caption)
+                            telegram.send_photo(photo, caption=caption, parse_mode="HTML")
                         else:
-                            telegram.send(caption)
+                            telegram.send_html(caption)
                     else:
-                        telegram.send(caption)
+                        telegram.send_html(caption)
                     last_telegram_alert_at = now
                 except Exception as exc:
                     print(f"Telegram alert failed: {exc}")
@@ -1295,19 +1451,14 @@ def run_verify(args: argparse.Namespace) -> None:
             telegram_callback_thread.join(timeout=0.5)
         if face_mesh is not None:
             face_mesh.close()
+        if relay is not None:
+            relay.cleanup()
         cap.release()
         cv2.destroyAllWindows()
 
 
 def main() -> None:
     args = build_parser().parse_args()
-    try:
-        import cv2  # noqa: F401
-    except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError(
-            "OpenCV is required. Install dependencies: pip install -r requirements.txt"
-        ) from exc
-
     if args.mode == "register":
         run_register(args)
     elif args.mode == "verify":
