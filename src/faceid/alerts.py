@@ -51,6 +51,46 @@ class TelegramAlerter:
             params["parse_mode"] = parse_mode
         self._api_get("sendMessage", params)
 
+    def send_document(
+        self,
+        file_bytes: bytes,
+        filename: str,
+        caption: str = "",
+        parse_mode: str = "",
+    ) -> None:
+        """Send any file (PDF, CSV, …) via sendDocument."""
+        if not self.is_configured():
+            return
+        boundary = f"faceid-{uuid4().hex}"
+        body = self._multipart_document_body(
+            boundary=boundary,
+            chat_id=self.chat_id,
+            file_bytes=file_bytes,
+            filename=filename,
+            caption=caption,
+            parse_mode=parse_mode if parse_mode else None,
+        )
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{self.bot_token}/sendDocument",
+            data=body,
+            headers={
+                "User-Agent": "faceid-alerts/1.0",
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+            },
+            method="POST",
+        )
+        last_exc: Exception | None = None
+        for delay in (*_RETRY_DELAYS, None):
+            try:
+                with urllib.request.urlopen(req, timeout=30.0):
+                    return
+            except Exception as exc:
+                last_exc = exc
+                if delay is not None:
+                    time.sleep(delay)
+        if last_exc is not None:
+            raise last_exc
+
     def send_photo(self, image_bytes: bytes, caption: str = "", parse_mode: str = "") -> None:
         if not self.is_configured():
             return
@@ -160,6 +200,41 @@ class TelegramAlerter:
         return {"ok": False, "error": str(last_exc)}
 
     @staticmethod
+    def _multipart_document_body(
+        boundary: str,
+        chat_id: str,
+        file_bytes: bytes,
+        filename: str,
+        caption: str,
+        parse_mode: str | None = None,
+    ) -> bytes:
+        crlf = b"\r\n"
+        chunks: list[bytes] = []
+
+        def add_text(name: str, value: str) -> None:
+            chunks.append(f"--{boundary}".encode())
+            chunks.append(f'Content-Disposition: form-data; name="{name}"'.encode())
+            chunks.append(b"")
+            chunks.append(value.encode("utf-8"))
+
+        add_text("chat_id", chat_id)
+        if caption:
+            add_text("caption", caption)
+        if parse_mode:
+            add_text("parse_mode", parse_mode)
+
+        chunks.append(f"--{boundary}".encode())
+        chunks.append(
+            f'Content-Disposition: form-data; name="document"; filename="{filename}"'.encode()
+        )
+        chunks.append(b"Content-Type: application/octet-stream")
+        chunks.append(b"")
+        chunks.append(file_bytes)
+        chunks.append(f"--{boundary}--".encode())
+        chunks.append(b"")
+        return crlf.join(chunks)
+
+    @staticmethod
     def _multipart_body(
         boundary: str,
         chat_id: str,
@@ -239,6 +314,15 @@ class MultiTelegramAlerter:
         self, message: str, actions: list[tuple[str, str]], parse_mode: str = ""
     ) -> None:
         self._each("send_with_actions", message, actions, parse_mode)
+
+    def send_document(
+        self,
+        file_bytes: bytes,
+        filename: str,
+        caption: str = "",
+        parse_mode: str = "",
+    ) -> None:
+        self._each("send_document", file_bytes, filename, caption, parse_mode)
 
     def send_photo(self, image_bytes: bytes, caption: str = "", parse_mode: str = "") -> None:
         self._each("send_photo", image_bytes, caption, parse_mode)

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import random
 import threading
 import time
 from collections import deque
@@ -15,14 +14,18 @@ from PIL import Image
 from src.faceid.modeling import (
     AccessEvent,
     IdentityRecord,
+    check_schedule_allowed,
     cleanup_old_events,
     cosine_similarity,
     get_attendance_today_utc,
     load_identities,
     log_access_event,
+    log_unknown_visit,
     mark_recent_false_incidents,
     normalize_vector,
+    save_individual_embeddings,
     upsert_identity_embedding,
+    upsert_identity_photo,
 )
 from src.faceid.alerts import MultiTelegramAlerter, TelegramAlerter
 from src.faceid.relay import RelayController
@@ -134,95 +137,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Minimum interval between anti-spoof inferences for CPU efficiency.",
     )
     verify.add_argument(
-        "--liveness-mode",
-        type=str,
-        choices=["passive", "fast", "motion", "blink"],
-        default="passive",
-        help="Liveness method: passive, fast, motion challenge, or blink challenge.",
-    )
-    verify.add_argument(
-        "--liveness-move-px",
-        type=float,
-        default=35.0,
-        help="Required face-center shift in pixels to pass liveness challenge.",
-    )
-    verify.add_argument(
-        "--liveness-timeout-sec",
-        type=float,
-        default=6.0,
-        help="Timeout for a single liveness challenge.",
-    )
-    verify.add_argument(
         "--liveness-hold-sec",
         type=float,
         default=3.0,
         help="How long liveness stays valid after passing.",
-    )
-    verify.add_argument(
-        "--blink-target",
-        type=int,
-        default=1,
-        help="How many blinks are required to pass blink liveness.",
-    )
-    verify.add_argument(
-        "--blink-ear-threshold",
-        type=float,
-        default=0.20,
-        help="EAR threshold below which eye is considered closed.",
-    )
-    verify.add_argument(
-        "--blink-min-closed-sec",
-        type=float,
-        default=0.8,
-        help="How long eyes must stay closed for one valid blink.",
-    )
-    verify.add_argument(
-        "--fast-window-sec",
-        type=float,
-        default=0.7,
-        help="Time window for fast liveness analysis.",
-    )
-    verify.add_argument(
-        "--fast-face-jitter-px",
-        type=float,
-        default=5.0,
-        help="Required face center motion (px) inside fast liveness window.",
-    )
-    verify.add_argument(
-        "--fast-ear-delta",
-        type=float,
-        default=0.015,
-        help="Required eye aspect ratio delta in fast liveness window.",
-    )
-    verify.add_argument(
-        "--fast-require-blink",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Require at least one real blink in fast liveness mode.",
-    )
-    verify.add_argument(
-        "--fast-blink-closed-threshold",
-        type=float,
-        default=0.19,
-        help="EAR threshold for closed eyes in fast blink detector.",
-    )
-    verify.add_argument(
-        "--fast-blink-open-threshold",
-        type=float,
-        default=0.24,
-        help="EAR threshold for open eyes in fast blink detector.",
-    )
-    verify.add_argument(
-        "--fast-blink-min-closed-frames",
-        type=int,
-        default=2,
-        help="Minimum consecutive closed-eye frames for valid blink in fast mode.",
-    )
-    verify.add_argument(
-        "--fast-blink-max-sec",
-        type=float,
-        default=1.0,
-        help="Maximum closed-eye duration for valid blink in fast mode.",
     )
     verify.add_argument(
         "--passive-window-sec",
@@ -374,6 +292,48 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help="Relay is active HIGH (default) or active LOW.",
     )
+    verify.add_argument(
+        "--schedule-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Deny access outside each employee's configured schedule.",
+    )
+    verify.add_argument(
+        "--cluster-unknowns",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Log unknown visitor embeddings for later clustering analysis.",
+    )
+    verify.add_argument(
+        "--cluster-unknowns-cooldown-sec",
+        type=float,
+        default=5.0,
+        help="Min interval between unknown visit log entries.",
+    )
+    verify.add_argument(
+        "--threshold-after-hours",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use stricter cosine threshold outside working hours.",
+    )
+    verify.add_argument(
+        "--threshold-night",
+        type=float,
+        default=0.82,
+        help="Stricter cosine threshold used outside working hours.",
+    )
+    verify.add_argument(
+        "--threshold-night-start",
+        type=int,
+        default=20,
+        help="Hour (local, 0-23) when stricter threshold kicks in.",
+    )
+    verify.add_argument(
+        "--threshold-night-end",
+        type=int,
+        default=8,
+        help="Hour (local, 0-23) when normal threshold resumes.",
+    )
     return parser
 
 
@@ -396,6 +356,22 @@ def largest_box(boxes: np.ndarray | None) -> np.ndarray | None:
         return None
     areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
     return boxes[int(np.argmax(areas))]
+
+
+def get_effective_threshold(args: argparse.Namespace) -> float:
+    """Return stricter threshold outside working hours if feature is enabled."""
+    if not getattr(args, "threshold_after_hours", False):
+        return args.threshold
+    import datetime
+    hour = datetime.datetime.now().hour
+    start = args.threshold_night_start
+    end = args.threshold_night_end
+    # Night window wraps midnight: start > end means e.g. 20–8
+    if start > end:
+        is_night = (hour >= start) or (hour < end)
+    else:
+        is_night = start <= hour < end
+    return args.threshold_night if is_night else args.threshold
 
 
 def put_status(frame: np.ndarray, text: str, color: tuple[int, int, int]) -> None:
@@ -423,6 +399,8 @@ def run_register(args: argparse.Namespace) -> None:
 
     embedder = FaceEmbedder(device=args.device, weights_path=args.weights_path)
     captured: list[np.ndarray] = []
+    best_face_crop: np.ndarray | None = None
+    best_sharpness: float = -1.0
     last_capture_at = 0.0
 
     print("Registration mode started. Press 'q' to quit.")
@@ -461,6 +439,16 @@ def run_register(args: argparse.Namespace) -> None:
                 if embedding is not None:
                     captured.append(embedding)
                     last_capture_at = now
+                    # Track best-quality face crop for photo storage
+                    if quality > best_sharpness and box is not None:
+                        x1, y1, x2, y2 = [int(v) for v in box]
+                        h, w = frame.shape[:2]
+                        x1, y1 = max(0, x1), max(0, y1)
+                        x2, y2 = min(w, x2), min(h, y2)
+                        crop = frame[y1:y2, x1:x2]
+                        if crop.size > 0:
+                            best_face_crop = crop.copy()
+                            best_sharpness = quality
                 elif quality > 0:
                     quality_note = f" LOW SHARPNESS({quality:.0f})"
 
@@ -483,7 +471,20 @@ def run_register(args: argparse.Namespace) -> None:
 
         centroid = normalize_vector(np.mean(np.stack(captured, axis=0), axis=0))
         upsert_identity_embedding(args.db_path, args.name, centroid)
-        print(f"User '{args.name}' saved to {args.db_path}")
+        save_individual_embeddings(args.db_path, args.name, captured)
+
+        # Save best face crop as employee photo
+        photo_path = ""
+        if best_face_crop is not None:
+            photos_dir = Path("artifacts/photos")
+            photos_dir.mkdir(parents=True, exist_ok=True)
+            photo_file = photos_dir / f"{args.name}.jpg"
+            cv2.imwrite(str(photo_file), best_face_crop)
+            photo_path = str(photo_file)
+            upsert_identity_photo(args.db_path, args.name, photo_path)
+            print(f"Photo saved: {photo_file}")
+
+        print(f"User '{args.name}' saved to {args.db_path} ({len(captured)} embeddings)")
     finally:
         cap.release()
         cv2.destroyAllWindows()
@@ -494,14 +495,20 @@ def match_identity(
 ) -> tuple[str, float]:
     if not identities:
         return "unknown", -1.0
-    # Batch cosine similarity via matrix multiply (all embeddings are pre-normalised).
-    matrix = np.stack([r.embedding for r in identities], axis=0)  # (N, D)
-    scores = matrix @ embedding  # equivalent to cosine sim for unit vectors
-    best_idx = int(np.argmax(scores))
-    best_score = float(scores[best_idx])
+    best_score = -1.0
+    best_name = "unknown"
+    for record in identities:
+        # Use individual embeddings when available, else fall back to centroid
+        vecs = record.all_embeddings if record.all_embeddings else (record.embedding,)
+        matrix = np.stack(vecs, axis=0)  # (K, D)
+        scores = matrix @ embedding       # cosine sim for unit vectors
+        score = float(np.max(scores))
+        if score > best_score:
+            best_score = score
+            best_name = record.name
     if best_score < threshold:
         return "unknown", best_score
-    return identities[best_idx].name, best_score
+    return best_name, best_score
 
 
 @dataclass(frozen=True)
@@ -521,6 +528,7 @@ def make_decision(
     liveness_ok: bool,
     identity: str,
     score: float,
+    schedule_ok: bool = True,
 ) -> AccessDecision:
     if not has_face:
         return AccessDecision(
@@ -549,6 +557,15 @@ def make_decision(
             color=(0, 165, 255),
             display_text="unknown",
         )
+    if not schedule_ok:
+        return AccessDecision(
+            decision="DENY_SCHEDULE",
+            reason="outside_schedule",
+            identity=identity,
+            score=score,
+            color=(100, 0, 200),
+            display_text=f"{identity} [вне расписания]",
+        )
     return AccessDecision(
         decision="ALLOW",
         reason="verified",
@@ -561,62 +578,6 @@ def make_decision(
 
 def face_center(box: np.ndarray) -> tuple[float, float]:
     return float((box[0] + box[2]) * 0.5), float((box[1] + box[3]) * 0.5)
-
-
-def random_challenge() -> str:
-    return random.choice(["left", "right", "up", "down"])
-
-
-def challenge_text(direction: str) -> str:
-    return f"Liveness: move {direction}"
-
-
-def challenge_passed(
-    direction: str,
-    baseline_center: tuple[float, float],
-    current_center: tuple[float, float],
-    threshold_px: float,
-) -> bool:
-    dx = current_center[0] - baseline_center[0]
-    dy = current_center[1] - baseline_center[1]
-    if direction == "left":
-        return dx <= -threshold_px
-    if direction == "right":
-        return dx >= threshold_px
-    if direction == "up":
-        return dy <= -threshold_px
-    return dy >= threshold_px
-
-
-def euclid(a: tuple[float, float], b: tuple[float, float]) -> float:
-    return float(((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5)
-
-
-def eye_aspect_ratio(points: list[tuple[float, float]]) -> float:
-    # points order: p1, p2, p3, p4, p5, p6
-    vertical = euclid(points[1], points[5]) + euclid(points[2], points[4])
-    horizontal = 2.0 * euclid(points[0], points[3])
-    if horizontal <= 1e-6:
-        return 1.0
-    return vertical / horizontal
-
-
-def get_blink_ear(frame: np.ndarray, face_mesh: object) -> float | None:
-    rgb = frame[:, :, ::-1]
-    result = face_mesh.process(rgb)
-    if not result.multi_face_landmarks:
-        return None
-    lm = result.multi_face_landmarks[0].landmark
-    h, w = frame.shape[:2]
-
-    def p(i: int) -> tuple[float, float]:
-        return (lm[i].x * w, lm[i].y * h)
-
-    left_idx = [33, 160, 158, 133, 153, 144]
-    right_idx = [362, 385, 387, 263, 373, 380]
-    left_ear = eye_aspect_ratio([p(i) for i in left_idx])
-    right_ear = eye_aspect_ratio([p(i) for i in right_idx])
-    return float((left_ear + right_ear) * 0.5)
 
 
 def trim_history(
@@ -762,8 +723,45 @@ def start_telegram_callback_worker(
         "/list — список зарегистрированных пользователей\n"
         "/stats — статистика за сегодня\n"
         "/attendance — посещаемость за сегодня\n"
-        "/status — статус системы"
+        "/status — статус системы\n"
+        "/report — отчёт за сегодня (PDF)\n"
+        "/report ГГГГ-ММ-ДД — отчёт за один день\n"
+        "/report ГГГГ-ММ-ДД ГГГГ-ММ-ДД — отчёт за период"
     )
+
+    def _handle_report_cmd(raw_text: str, tg, db: Path) -> None:
+        """Parse /report [start] [end] and send PDF to all recipients."""
+        import tempfile
+        from src.faceid.modeling import export_pdf_report
+        today = datetime.datetime.now().strftime("%Y-%m-%d")
+        parts = raw_text.strip().split()
+        # /report                    → today
+        # /report ГГГГ-ММ-ДД        → single day
+        # /report ГГГГ-ММ-ДД ГГГГ-ММ-ДД → range
+        if len(parts) == 1:
+            start_date = end_date = today
+        elif len(parts) == 2:
+            start_date = end_date = parts[1]
+        elif len(parts) >= 3:
+            start_date, end_date = parts[1], parts[2]
+        else:
+            start_date = end_date = today
+
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                tmp_path = Path(tmp.name)
+            n = export_pdf_report(db, start_date, end_date, tmp_path)
+            pdf_bytes = tmp_path.read_bytes()
+            tmp_path.unlink(missing_ok=True)
+            filename = f"faceid_report_{start_date}_{end_date}.pdf"
+            caption = (
+                f"&#128196; <b>FaceID — Отчёт о посещаемости</b>\n"
+                f"Период: <code>{start_date}</code> — <code>{end_date}</code>\n"
+                f"Строк: <b>{n}</b>"
+            )
+            tg.send_document(pdf_bytes, filename, caption=caption, parse_mode="HTML")
+        except Exception as exc:
+            tg.send_html(f"&#10060; Ошибка при формировании отчёта:\n<code>{exc}</code>")
 
     def worker() -> None:
         offset: int | None = None
@@ -799,6 +797,8 @@ def start_telegram_callback_worker(
                             f"&#128994; Система активна\n"
                             f"&#128336; Время: <code>{now_str}</code>"
                         )
+                    elif raw_text.lower().startswith("/report"):
+                        _handle_report_cmd(raw_text, telegram, db_path)
 
                     cb = upd.get("callback_query") or {}
                     data = str(cb.get("data", ""))
@@ -878,19 +878,7 @@ def run_verify(args: argparse.Namespace) -> None:
         if deleted > 0:
             print(f"Cleaned old events: {deleted}")
 
-    liveness_direction: str | None = None
-    liveness_baseline: tuple[float, float] | None = None
-    liveness_started_at = 0.0
     liveness_ok_until = 0.0
-    blink_count = 0
-    eyes_closed_since: float | None = None
-    long_close_ready = False
-    fast_centers: deque[tuple[float, float, float]] = deque()
-    fast_ears: deque[tuple[float, float]] = deque()
-    fast_blink_count = 0
-    fast_eye_state = "open"
-    fast_closed_frames = 0
-    fast_closed_started_at: float | None = None
     passive_prev_gray: np.ndarray | None = None
     passive_residual_hist: deque[tuple[float, float]] = deque()
     passive_texture_hist: deque[tuple[float, float]] = deque()
@@ -903,6 +891,7 @@ def run_verify(args: argparse.Namespace) -> None:
 
     last_logged_key: tuple[str, str, str] | None = None
     last_logged_at = 0.0
+    last_unknown_visit_at = 0.0
     deny_events: deque[float] = deque()
     deny_streak_started_at: float | None = None
     unknown_started_at: float | None = None
@@ -936,34 +925,6 @@ def run_verify(args: argparse.Namespace) -> None:
             )
         except Exception as exc:
             print(f"Telegram menu send failed: {exc}")
-
-    face_mesh = None
-    effective_liveness_mode = args.liveness_mode
-    if args.liveness and args.liveness_mode in {"blink", "fast"}:
-        try:
-            import mediapipe as mp
-            if not hasattr(mp, "solutions"):
-                raise AttributeError("mediapipe has no attribute 'solutions'")
-            face_mesh = mp.solutions.face_mesh.FaceMesh(
-                static_image_mode=False,
-                max_num_faces=1,
-                refine_landmarks=False,
-                min_detection_confidence=0.5,
-                min_tracking_confidence=0.5,
-            )
-        except Exception as exc:
-            print(
-                "Blink liveness is unavailable (mediapipe issue). "
-                f"Falling back to motion liveness. Details: {exc}"
-            )
-            effective_liveness_mode = "motion"
-    if (
-        args.liveness
-        and effective_liveness_mode == "fast"
-        and args.fast_require_blink
-        and face_mesh is None
-    ):
-        print("Fast blink requirement disabled: face landmarks unavailable.")
 
     _cam_fail = 0
     _CAM_FAIL_MAX = 30
@@ -1019,212 +980,54 @@ def run_verify(args: argparse.Namespace) -> None:
 
                 if live_ready and args.liveness:
                     live_ready = now <= liveness_ok_until
-                    if effective_liveness_mode == "motion":
-                        center = face_center(box)
-                        if not live_ready:
-                            if liveness_direction is None:
-                                liveness_direction = random_challenge()
-                                liveness_baseline = center
-                                liveness_started_at = now
-                            else:
-                                if (
-                                    liveness_baseline is not None
-                                    and challenge_passed(
-                                        liveness_direction,
-                                        liveness_baseline,
-                                        center,
-                                        args.liveness_move_px,
-                                    )
-                                ):
-                                    liveness_ok_until = now + args.liveness_hold_sec
-                                    liveness_direction = None
-                                    liveness_baseline = None
-                                    live_ready = True
-                                elif now - liveness_started_at > args.liveness_timeout_sec:
-                                    liveness_direction = random_challenge()
-                                    liveness_baseline = center
-                                    liveness_started_at = now
-
-                        if not live_ready and liveness_direction is not None:
-                            status_suffix = f" | {challenge_text(liveness_direction)}"
+                    if not live_ready:
+                        face_gray = crop_face_gray(frame, box)
+                        if face_gray is None:
+                            passive_prev_gray = None
+                            passive_residual_hist.clear()
+                            passive_texture_hist.clear()
+                            passive_center_hist.clear()
+                            status_suffix = " | liveness passive: no face ROI"
                             color = (0, 165, 255)
-                    elif effective_liveness_mode == "passive":
-                        if not live_ready:
-                            face_gray = crop_face_gray(frame, box)
-                            if face_gray is None:
-                                passive_prev_gray = None
+                        else:
+                            cx, cy = face_center(box)
+                            passive_center_hist.append((now, cx, cy))
+                            trim_history(passive_center_hist, now, args.passive_window_sec)
+                            if passive_prev_gray is not None:
+                                residual, texture = passive_flow_metrics(passive_prev_gray, face_gray)
+                                passive_residual_hist.append((now, residual))
+                                passive_texture_hist.append((now, texture))
+                                trim_history(passive_residual_hist, now, args.passive_window_sec)
+                                trim_history(passive_texture_hist, now, args.passive_window_sec)
+                            passive_prev_gray = face_gray
+
+                            residual_score = max((v for _, v in passive_residual_hist), default=0.0)
+                            texture_score = max((v for _, v in passive_texture_hist), default=0.0)
+                            if len(passive_center_hist) >= 2:
+                                xs = [c[1] for c in passive_center_hist]
+                                ys = [c[2] for c in passive_center_hist]
+                                face_jitter = float(
+                                    ((max(xs) - min(xs)) ** 2 + (max(ys) - min(ys)) ** 2) ** 0.5
+                                )
+                            else:
+                                face_jitter = 0.0
+
+                            flow_ok = residual_score >= args.passive_residual_flow
+                            texture_ok = texture_score >= args.passive_min_texture
+                            attention_ok = face_jitter <= args.passive_max_face_jitter_px
+                            if flow_ok and texture_ok and attention_ok:
+                                liveness_ok_until = now + args.liveness_hold_sec
+                                live_ready = True
                                 passive_residual_hist.clear()
                                 passive_texture_hist.clear()
                                 passive_center_hist.clear()
-                                status_suffix = " | liveness passive: no face ROI"
-                                color = (0, 165, 255)
-                            else:
-                                cx, cy = face_center(box)
-                                passive_center_hist.append((now, cx, cy))
-                                trim_history(passive_center_hist, now, args.passive_window_sec)
-                                if passive_prev_gray is not None:
-                                    residual, texture = passive_flow_metrics(passive_prev_gray, face_gray)
-                                    passive_residual_hist.append((now, residual))
-                                    passive_texture_hist.append((now, texture))
-                                    trim_history(passive_residual_hist, now, args.passive_window_sec)
-                                    trim_history(passive_texture_hist, now, args.passive_window_sec)
-                                passive_prev_gray = face_gray
-
-                                if passive_residual_hist:
-                                    residual_score = max(v for _, v in passive_residual_hist)
-                                else:
-                                    residual_score = 0.0
-                                if passive_texture_hist:
-                                    texture_score = max(v for _, v in passive_texture_hist)
-                                else:
-                                    texture_score = 0.0
-                                if len(passive_center_hist) >= 2:
-                                    xs = [c[1] for c in passive_center_hist]
-                                    ys = [c[2] for c in passive_center_hist]
-                                    face_jitter = float(
-                                        ((max(xs) - min(xs)) ** 2 + (max(ys) - min(ys)) ** 2) ** 0.5
-                                    )
-                                else:
-                                    face_jitter = 0.0
-
-                                flow_ok = residual_score >= args.passive_residual_flow
-                                texture_ok = texture_score >= args.passive_min_texture
-                                attention_ok = face_jitter <= args.passive_max_face_jitter_px
-                                if flow_ok and texture_ok and attention_ok:
-                                    liveness_ok_until = now + args.liveness_hold_sec
-                                    live_ready = True
-                                    passive_residual_hist.clear()
-                                    passive_texture_hist.clear()
-                                    passive_center_hist.clear()
-                                else:
-                                    status_suffix = (
-                                        f" | passive flow={residual_score:.3f}/{args.passive_residual_flow:.3f}"
-                                        f" tex={texture_score:.1f}/{args.passive_min_texture:.1f}"
-                                        f" jitter={face_jitter:.1f}/{args.passive_max_face_jitter_px:.1f}"
-                                    )
-                                    color = (0, 165, 255)
-                    elif effective_liveness_mode == "fast":
-                        if not live_ready:
-                            cx, cy = face_center(box)
-                            fast_centers.append((now, cx, cy))
-                            trim_history(fast_centers, now, args.fast_window_sec)
-
-                            ear = None
-                            if face_mesh is not None:
-                                ear = get_blink_ear(frame, face_mesh)
-                            if ear is not None:
-                                fast_ears.append((now, ear))
-                            trim_history(fast_ears, now, args.fast_window_sec)
-
-                            motion_ok = False
-                            if len(fast_centers) >= 2:
-                                xs = [item[1] for item in fast_centers]
-                                ys = [item[2] for item in fast_centers]
-                                motion = float(
-                                    ((max(xs) - min(xs)) ** 2 + (max(ys) - min(ys)) ** 2) ** 0.5
-                                )
-                                motion_ok = motion >= args.fast_face_jitter_px
-                            else:
-                                motion = 0.0
-
-                            ear_ok = True
-                            if face_mesh is not None:
-                                ear_ok = False
-                                if len(fast_ears) >= 2:
-                                    ears = [item[1] for item in fast_ears]
-                                    ear_delta = float(max(ears) - min(ears))
-                                    ear_ok = ear_delta >= args.fast_ear_delta
-                                else:
-                                    ear_delta = 0.0
-                                # Blink detector with hysteresis to avoid false triggers.
-                                if ear is not None:
-                                    if ear < args.fast_blink_closed_threshold:
-                                        fast_closed_frames += 1
-                                        if fast_eye_state == "open":
-                                            fast_eye_state = "closed"
-                                            fast_closed_started_at = now
-                                    elif ear > args.fast_blink_open_threshold:
-                                        if fast_eye_state == "closed":
-                                            closed_for = (
-                                                now - fast_closed_started_at
-                                                if fast_closed_started_at is not None
-                                                else 0.0
-                                            )
-                                            if (
-                                                fast_closed_frames
-                                                >= args.fast_blink_min_closed_frames
-                                                and closed_for <= args.fast_blink_max_sec
-                                            ):
-                                                fast_blink_count += 1
-                                        fast_eye_state = "open"
-                                        fast_closed_frames = 0
-                                        fast_closed_started_at = None
-                            else:
-                                ear_delta = 0.0
-
-                            blink_ok = (not args.fast_require_blink) or (
-                                fast_blink_count >= 1 and face_mesh is not None
-                            )
-
-                            if motion_ok and ear_ok and blink_ok:
-                                liveness_ok_until = now + args.liveness_hold_sec
-                                live_ready = True
-                                fast_centers.clear()
-                                fast_ears.clear()
-                                fast_blink_count = 0
-                                fast_eye_state = "open"
-                                fast_closed_frames = 0
-                                fast_closed_started_at = None
                             else:
                                 status_suffix = (
-                                    f" | liveness fast m={motion:.1f}/{args.fast_face_jitter_px:.1f}"
+                                    f" | passive flow={residual_score:.3f}/{args.passive_residual_flow:.3f}"
+                                    f" tex={texture_score:.1f}/{args.passive_min_texture:.1f}"
+                                    f" jitter={face_jitter:.1f}/{args.passive_max_face_jitter_px:.1f}"
                                 )
-                                if face_mesh is not None:
-                                    status_suffix += (
-                                        f" e={ear_delta:.3f}/{args.fast_ear_delta:.3f}"
-                                    )
-                                    if args.fast_require_blink:
-                                        status_suffix += f" b={fast_blink_count}/1"
                                 color = (0, 165, 255)
-                    else:
-                        if not live_ready and face_mesh is not None:
-                            ear = get_blink_ear(frame, face_mesh)
-                            if ear is None:
-                                blink_count = 0
-                                eyes_closed_since = None
-                                long_close_ready = False
-                                status_suffix = " | liveness: eyes not visible"
-                            else:
-                                if ear < args.blink_ear_threshold:
-                                    if eyes_closed_since is None:
-                                        eyes_closed_since = now
-                                    closed_for = now - eyes_closed_since
-                                    if closed_for >= args.blink_min_closed_sec:
-                                        long_close_ready = True
-                                        status_suffix = (
-                                            f" | eyes closed {closed_for:.1f}s, now open"
-                                        )
-                                    else:
-                                        status_suffix = (
-                                            f" | hold eyes closed {closed_for:.1f}s/"
-                                            f"{args.blink_min_closed_sec:.1f}s"
-                                        )
-                                else:
-                                    if long_close_ready:
-                                        blink_count += 1
-                                    long_close_ready = False
-                                    eyes_closed_since = None
-                                if blink_count >= args.blink_target:
-                                    liveness_ok_until = now + args.liveness_hold_sec
-                                    blink_count = 0
-                                    eyes_closed_since = None
-                                    long_close_ready = False
-                                    live_ready = True
-                                else:
-                                    status_suffix = (
-                                        f" | liveness: blink {blink_count}/{args.blink_target}"
-                                    )
-                                    color = (0, 165, 255)
 
                 if live_ready:
                     liveness_ok = True
@@ -1239,7 +1042,12 @@ def run_verify(args: argparse.Namespace) -> None:
                             )
                         else:
                             mean_emb = embedding
-                        name, score = match_identity(mean_emb, identities, args.threshold)
+                        name, score = match_identity(mean_emb, identities, get_effective_threshold(args))
+                        # Log unknown visit for clustering analysis
+                        if name == "unknown" and args.cluster_unknowns:
+                            if now - last_unknown_visit_at >= args.cluster_unknowns_cooldown_sec:
+                                log_unknown_visit(args.db_path, mean_emb)
+                                last_unknown_visit_at = now
                         color = (0, 200, 0) if name != "unknown" else (0, 165, 255)
                         ok_suffix = []
                         if args.anti_spoof:
@@ -1249,38 +1057,21 @@ def run_verify(args: argparse.Namespace) -> None:
                         if ok_suffix:
                             status_suffix = " | " + " + ".join(ok_suffix)
                 elif anti_spoof_blocked:
-                    liveness_direction = None
-                    liveness_baseline = None
-                    blink_count = 0
-                    eyes_closed_since = None
-                    long_close_ready = False
                     passive_prev_gray = None
                     passive_residual_hist.clear()
                     passive_texture_hist.clear()
                     passive_center_hist.clear()
-                    fast_centers.clear()
-                    fast_ears.clear()
-                    fast_blink_count = 0
-                    fast_eye_state = "open"
-                    fast_closed_frames = 0
-                    fast_closed_started_at = None
             else:
-                liveness_direction = None
-                liveness_baseline = None
-                blink_count = 0
-                eyes_closed_since = None
-                long_close_ready = False
                 passive_prev_gray = None
                 passive_residual_hist.clear()
                 passive_texture_hist.clear()
                 passive_center_hist.clear()
-                fast_centers.clear()
-                fast_ears.clear()
-                fast_blink_count = 0
-                fast_eye_state = "open"
-                fast_closed_frames = 0
-                fast_closed_started_at = None
                 embed_buffer.clear()  # reset temporal buffer when face leaves frame
+
+            # Schedule check for known identities
+            sched_ok = True
+            if args.schedule_enabled and name != "unknown":
+                sched_ok, _ = check_schedule_allowed(args.db_path, name)
 
             decision = make_decision(
                 has_face=box is not None,
@@ -1288,6 +1079,7 @@ def run_verify(args: argparse.Namespace) -> None:
                 liveness_ok=liveness_ok,
                 identity=name,
                 score=score,
+                schedule_ok=sched_ok,
             )
             if (
                 args.telegram_enabled
@@ -1449,8 +1241,6 @@ def run_verify(args: argparse.Namespace) -> None:
         telegram_stop_event.set()
         if telegram_callback_thread is not None:
             telegram_callback_thread.join(timeout=0.5)
-        if face_mesh is not None:
-            face_mesh.close()
         if relay is not None:
             relay.cleanup()
         cap.release()
