@@ -59,6 +59,8 @@ class FaceIdGui(tk.Tk):
 
         self.proc: subprocess.Popen[str] | None = None
         self.output_thread: threading.Thread | None = None
+        self._cam_stop_event: threading.Event = threading.Event()
+        self._cam_thread: threading.Thread | None = None
 
         self._init_vars()
         self._load_config()
@@ -318,9 +320,26 @@ class FaceIdGui(tk.Tk):
         self.log.grid(row=0, column=0, sticky="nsew")
         log_sb.grid(row=0, column=1, sticky="ns")
 
-        # ── последние события ─────────────────────────────────────────────────
-        ev_frame = ttk.LabelFrame(t, text="Последние события", padding=6)
-        ev_frame.grid(row=2, column=1, sticky="nsew")
+        # ── правая панель: камера + события ──────────────────────────────────
+        right = tk.Frame(t, bg=C_BG)
+        right.grid(row=2, column=1, sticky="nsew")
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(1, weight=1)
+
+        cam_outer = ttk.LabelFrame(right, text="Камера", padding=4)
+        cam_outer.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        cam_outer.columnconfigure(0, weight=1)
+        cam_container = tk.Frame(cam_outer, bg="#0f172a", width=400, height=300)
+        cam_container.pack(fill=tk.BOTH, expand=True)
+        cam_container.pack_propagate(False)
+        self._cam_label = tk.Label(cam_container, bg="#0f172a",
+                                   text="Камера неактивна", fg="#64748b",
+                                   font=("Segoe UI", 11))
+        self._cam_label.pack(fill=tk.BOTH, expand=True)
+        self._cam_photo_ref = None
+
+        ev_frame = ttk.LabelFrame(right, text="Последние события", padding=6)
+        ev_frame.grid(row=1, column=0, sticky="nsew")
         ev_frame.rowconfigure(0, weight=1)
         ev_frame.columnconfigure(0, weight=1)
 
@@ -351,6 +370,470 @@ class FaceIdGui(tk.Tk):
                  font=("Segoe UI", 9)).pack(pady=(10, 2), padx=14)
         tk.Label(card, textvariable=var, bg=C_WHITE, fg=color,
                  font=("Segoe UI", 26, "bold")).pack(pady=(0, 10), padx=14)
+
+    # ═══════════════════════════ КАМЕРА (встроенная) ═════════════════════════
+
+    def _show_frame(self, frame) -> None:
+        if not _PIL_OK:
+            return
+        try:
+            h, w = frame.shape[:2]
+            target_w = self._cam_label.winfo_width() or 360
+            target_h = int(target_w * h / w) if w else 270
+            import cv2 as _cv2
+            resized = _cv2.resize(frame[:, :, ::-1], (target_w, target_h))
+            img = Image.fromarray(resized)
+            photo = ImageTk.PhotoImage(img)
+            self._cam_label.configure(image=photo, text="")
+            self._cam_photo_ref = photo
+        except Exception:
+            pass
+
+    def _clear_cam_panel(self) -> None:
+        self._cam_photo_ref = None
+        self._cam_label.configure(image="", text="Камера неактивна", fg="#64748b")
+
+    def _on_cam_exit(self, exit_code: int) -> None:
+        self._cam_thread = None
+        self._clear_cam_panel()
+        if exit_code == 0:
+            self.set_status("IDLE", "Ожидание")
+            self._refresh_db_tab()
+        else:
+            self.set_status("ERROR", f"Ошибка (код {exit_code})")
+
+    def _busy(self) -> bool:
+        return self.proc is not None or (
+            self._cam_thread is not None and self._cam_thread.is_alive()
+        )
+
+    def _run_register_embedded(self, args) -> None:
+        import time as _time
+        import cv2 as _cv2
+        import numpy as _np
+        from PIL import Image as _Img
+        from pathlib import Path as _Path
+        from src.faceid.embedding import FaceEmbedder
+        from camera_app import largest_box, draw_box, put_status
+        from src.faceid.modeling import (
+            upsert_identity_embedding, save_individual_embeddings, upsert_identity_photo,
+            normalize_vector,
+        )
+        try:
+            device = args.device or None
+            self.after(0, self.append_log, "Загрузка модели FaceNet...")
+            embedder = FaceEmbedder(device=device, weights_path=args.weights_path)
+            cap = _cv2.VideoCapture(args.camera_index)
+            if not cap.isOpened():
+                self.after(0, self.append_log,
+                           f"Ошибка: камера {args.camera_index} недоступна")
+                self.after(0, self._on_cam_exit, 1)
+                return
+
+            captured: list = []
+            best_face_crop = None
+            best_sharpness = -1.0
+            last_capture_at = 0.0
+            _cam_fail = 0
+
+            self.after(0, self.append_log,
+                       f"Регистрация «{args.name}»: 0/{args.samples}")
+
+            while not self._cam_stop_event.is_set():
+                ok, frame = cap.read()
+                if not ok:
+                    _cam_fail += 1
+                    if _cam_fail >= 30:
+                        cap.release()
+                        _time.sleep(0.5)
+                        cap = _cv2.VideoCapture(args.camera_index)
+                        _cam_fail = 0
+                    continue
+                _cam_fail = 0
+
+                pil = _Img.fromarray(frame[:, :, ::-1])
+                boxes = embedder.detect_boxes(pil)
+                box = largest_box(boxes)
+                draw_box(frame, box, (255, 255, 0))
+
+                now = _time.monotonic()
+                ready = now - last_capture_at >= getattr(args, "capture_interval_sec", 0.5)
+                quality_note = ""
+                if box is not None and ready and len(captured) < args.samples:
+                    emb, quality = embedder.extract_single_gated(pil)
+                    if emb is not None:
+                        captured.append(emb)
+                        last_capture_at = now
+                        if quality > best_sharpness:
+                            x1, y1, x2, y2 = [int(v) for v in box]
+                            hf, wf = frame.shape[:2]
+                            crop = frame[max(0, y1):min(hf, y2), max(0, x1):min(wf, x2)]
+                            if crop.size > 0:
+                                best_face_crop = crop.copy()
+                                best_sharpness = quality
+                        self.after(0, self.append_log,
+                                   f"  снимок {len(captured)}/{args.samples}")
+                    elif quality > 0:
+                        quality_note = f" LOW({quality:.0f})"
+
+                color = (0, 255, 255) if not quality_note else (0, 165, 255)
+                put_status(frame,
+                           f"Register {args.name}: {len(captured)}/{args.samples}{quality_note}",
+                           color)
+                self.after(0, self._show_frame, frame.copy())
+
+                if len(captured) >= args.samples:
+                    break
+
+            cap.release()
+
+            if not captured:
+                self.after(0, self.append_log, "Ошибка: снимки лица не получены.")
+                self.after(0, self._on_cam_exit, 1)
+                return
+
+            centroid = normalize_vector(
+                _np.mean(_np.stack(captured, axis=0), axis=0))
+            upsert_identity_embedding(args.db_path, args.name, centroid)
+            save_individual_embeddings(args.db_path, args.name, captured)
+
+            if best_face_crop is not None:
+                photos_dir = _Path("artifacts/photos")
+                photos_dir.mkdir(parents=True, exist_ok=True)
+                photo_file = photos_dir / f"{args.name}.jpg"
+                _cv2.imwrite(str(photo_file), best_face_crop)
+                upsert_identity_photo(args.db_path, args.name, str(photo_file))
+                self.after(0, self.append_log, f"Фото сохранено: {photo_file}")
+
+            self.after(0, self.append_log,
+                       f"Пользователь «{args.name}» сохранён ({len(captured)} снимков)")
+            self.after(0, self._on_cam_exit, 0)
+        except Exception as exc:
+            self.after(0, self.append_log, f"Ошибка регистрации: {exc}")
+            self.after(0, self._on_cam_exit, 1)
+
+    def _run_verify_embedded(self, args) -> None:
+        import time as _time
+        import cv2 as _cv2
+        import numpy as _np
+        from collections import deque as _deque
+        from PIL import Image as _Img
+        from camera_app import (
+            largest_box, draw_box, put_status, match_identity, make_decision,
+            AccessDecision, get_effective_threshold, crop_face_gray,
+            passive_flow_metrics, face_center, trim_history,
+            encode_alert_photo, start_telegram_callback_worker,
+        )
+        from src.faceid.embedding import FaceEmbedder
+        from src.faceid.modeling import (
+            load_identities, cleanup_old_events, log_access_event, AccessEvent,
+            mark_recent_false_incidents, log_unknown_visit, check_schedule_allowed,
+            get_attendance_today_utc,
+        )
+        from src.faceid.alerts import TelegramAlerter, MultiTelegramAlerter
+        from src.faceid.relay import RelayController
+        from anti_spoof import AntiSpoofModel
+        from pathlib import Path as _Path
+
+        try:
+            identities = load_identities(args.db_path)
+            if not identities:
+                self.after(0, self.append_log,
+                           "Ошибка: база данных пуста. Зарегистрируйте сотрудников.")
+                self.after(0, self._on_cam_exit, 1)
+                return
+
+            device = args.device or None
+            self.after(0, self.append_log, "Загрузка модели FaceNet...")
+            embedder = FaceEmbedder(device=device, weights_path=args.weights_path)
+
+            anti_spoof = None
+            if args.anti_spoof:
+                try:
+                    anti_spoof = AntiSpoofModel(
+                        model_path=args.anti_spoof_model_path,
+                        threshold=args.anti_spoof_threshold,
+                        device=device or "cpu",
+                        input_size=getattr(args, "anti_spoof_input_size", 128),
+                        margin_ratio=getattr(args, "anti_spoof_margin_ratio", 0.20),
+                        min_interval_sec=getattr(args, "anti_spoof_min_interval_sec", 0.10),
+                    )
+                except Exception as exc:
+                    self.after(0, self.append_log,
+                               f"Антиспуф недоступен: {exc}. Продолжаем без него.")
+                    args.anti_spoof = False
+
+            cap = _cv2.VideoCapture(args.camera_index)
+            if not cap.isOpened():
+                self.after(0, self.append_log,
+                           f"Ошибка: камера {args.camera_index} недоступна")
+                self.after(0, self._on_cam_exit, 1)
+                return
+
+            relay = None
+            if args.relay_enabled:
+                try:
+                    relay = RelayController(
+                        pin=args.relay_pin,
+                        active_high=args.relay_active_high,
+                        door_open_sec=args.relay_duration_sec,
+                    )
+                except Exception:
+                    pass
+
+            if args.event_ttl_days > 0:
+                deleted = cleanup_old_events(args.db_path, ttl_days=args.event_ttl_days)
+                if deleted > 0:
+                    self.after(0, self.append_log, f"Очищено старых событий: {deleted}")
+
+            _token = args.telegram_bot_token.strip()
+            _alerters = [TelegramAlerter(bot_token=_token,
+                                         chat_id=args.telegram_chat_id.strip())]
+            if getattr(args, "telegram_chat_id2", "").strip():
+                _alerters.append(TelegramAlerter(bot_token=_token,
+                                                 chat_id=args.telegram_chat_id2.strip()))
+            telegram = MultiTelegramAlerter(alerters=_alerters)
+            if args.telegram_enabled and not telegram.is_configured():
+                args.telegram_enabled = False
+            telegram_stop_event = threading.Event()
+            telegram_cb_thread = None
+            admin_state: dict = {"allow_until": 0.0}
+            if args.telegram_enabled and args.telegram_admin_buttons:
+                telegram_cb_thread = start_telegram_callback_worker(
+                    telegram=telegram, state=admin_state,
+                    stop_event=telegram_stop_event,
+                    allow_sec=args.telegram_admin_allow_sec,
+                    db_path=args.db_path,
+                )
+
+            liveness_ok_until = 0.0
+            passive_prev_gray = None
+            passive_residual_hist: _deque = _deque()
+            passive_texture_hist: _deque  = _deque()
+            passive_center_hist: _deque   = _deque()
+            embed_buffer: _deque          = _deque(maxlen=6)
+            last_logged_key = None
+            last_logged_at = 0.0
+            last_unknown_visit_at = 0.0
+            deny_events: _deque           = _deque()
+            deny_streak_started_at        = None
+            unknown_started_at            = None
+            last_telegram_alert_at        = 0.0
+            last_unknown_alert_at         = 0.0
+            _cam_fail = 0
+
+            self.after(0, self.append_log, "Верификация запущена.")
+
+            while not self._cam_stop_event.is_set():
+                ok, frame = cap.read()
+                if not ok:
+                    _cam_fail += 1
+                    if _cam_fail >= 30:
+                        cap.release()
+                        _time.sleep(0.5)
+                        cap = _cv2.VideoCapture(args.camera_index)
+                        _cam_fail = 0
+                    continue
+                _cam_fail = 0
+
+                pil = _Img.fromarray(frame[:, :, ::-1])
+                boxes = embedder.detect_boxes(pil)
+                box = largest_box(boxes)
+
+                name = "unknown"
+                score = -1.0
+                color = (0, 0, 255)
+                status_suffix = ""
+                now = _time.monotonic()
+                liveness_required = args.liveness or args.anti_spoof
+                liveness_ok = not liveness_required
+
+                if box is not None:
+                    live_ready = True
+                    anti_spoof_blocked = False
+                    if args.anti_spoof and anti_spoof is not None:
+                        try:
+                            r = anti_spoof.predict(frame, box, now)
+                            if not r.is_live:
+                                live_ready = False
+                                anti_spoof_blocked = True
+                                status_suffix = (
+                                    f" | anti-spoof: FAKE {r.live_score:.2f}/"
+                                    f"{args.anti_spoof_threshold:.2f}"
+                                )
+                                color = (0, 165, 255)
+                        except Exception as exc:
+                            live_ready = False
+                            anti_spoof_blocked = True
+                            status_suffix = f" | anti-spoof err: {exc}"
+                            color = (0, 165, 255)
+
+                    if live_ready and args.liveness:
+                        live_ready = now <= liveness_ok_until
+                        if not live_ready:
+                            face_gray = crop_face_gray(frame, box)
+                            if face_gray is None:
+                                passive_prev_gray = None
+                                passive_residual_hist.clear()
+                                passive_texture_hist.clear()
+                                passive_center_hist.clear()
+                                status_suffix = " | liveness: no face ROI"
+                                color = (0, 165, 255)
+                            else:
+                                cx, cy = face_center(box)
+                                passive_center_hist.append((now, cx, cy))
+                                trim_history(passive_center_hist, now, args.passive_window_sec)
+                                if passive_prev_gray is not None:
+                                    res, tex = passive_flow_metrics(passive_prev_gray, face_gray)
+                                    passive_residual_hist.append((now, res))
+                                    passive_texture_hist.append((now, tex))
+                                    trim_history(passive_residual_hist, now, args.passive_window_sec)
+                                    trim_history(passive_texture_hist, now, args.passive_window_sec)
+                                passive_prev_gray = face_gray
+
+                                res_score = max((v for _, v in passive_residual_hist), default=0.0)
+                                tex_score = max((v for _, v in passive_texture_hist), default=0.0)
+                                if len(passive_center_hist) >= 2:
+                                    xs = [c[1] for c in passive_center_hist]
+                                    ys = [c[2] for c in passive_center_hist]
+                                    jitter = float(
+                                        ((max(xs)-min(xs))**2+(max(ys)-min(ys))**2)**0.5)
+                                else:
+                                    jitter = 0.0
+
+                                flow_ok = res_score >= args.passive_residual_flow
+                                tex_ok  = tex_score >= args.passive_min_texture
+                                att_ok  = jitter    <= args.passive_max_face_jitter_px
+                                if flow_ok and tex_ok and att_ok:
+                                    liveness_ok_until = now + getattr(args, "liveness_hold_sec", 3.0)
+                                    live_ready = True
+                                    passive_residual_hist.clear()
+                                    passive_texture_hist.clear()
+                                    passive_center_hist.clear()
+                                else:
+                                    status_suffix = (
+                                        f" | flow={res_score:.3f}/{args.passive_residual_flow:.3f}"
+                                        f" tex={tex_score:.1f}/{args.passive_min_texture:.1f}"
+                                        f" jit={jitter:.1f}/{args.passive_max_face_jitter_px:.1f}"
+                                    )
+                                    color = (0, 165, 255)
+
+                    if live_ready:
+                        liveness_ok = True
+                        emb, quality = embedder.extract_single_gated(pil)
+                        if emb is not None:
+                            embed_buffer.append(emb)
+                            if len(embed_buffer) >= 2:
+                                from src.faceid.modeling import normalize_vector as _nv
+                                mean_emb = _nv(_np.mean(
+                                    _np.stack(list(embed_buffer), axis=0), axis=0))
+                            else:
+                                mean_emb = emb
+                            name, score = match_identity(
+                                mean_emb, identities, get_effective_threshold(args))
+                            if name == "unknown" and args.cluster_unknowns:
+                                if now - last_unknown_visit_at >= getattr(
+                                        args, "cluster_unknowns_cooldown_sec", 5.0):
+                                    log_unknown_visit(args.db_path, mean_emb)
+                                    last_unknown_visit_at = now
+                            color = (0, 200, 0) if name != "unknown" else (0, 165, 255)
+                            ok_sfx = []
+                            if args.anti_spoof: ok_sfx.append("anti-spoof OK")
+                            if args.liveness:   ok_sfx.append("liveness OK")
+                            if ok_sfx: status_suffix = " | " + " + ".join(ok_sfx)
+                    elif anti_spoof_blocked:
+                        passive_prev_gray = None
+                        passive_residual_hist.clear()
+                        passive_texture_hist.clear()
+                        passive_center_hist.clear()
+                else:
+                    passive_prev_gray = None
+                    passive_residual_hist.clear()
+                    passive_texture_hist.clear()
+                    passive_center_hist.clear()
+                    embed_buffer.clear()
+
+                sched_ok = True
+                if args.schedule_enabled and name != "unknown":
+                    sched_ok, _ = check_schedule_allowed(args.db_path, name)
+
+                decision = make_decision(
+                    has_face=box is not None,
+                    liveness_required=liveness_required,
+                    liveness_ok=liveness_ok,
+                    identity=name,
+                    score=score,
+                    schedule_ok=sched_ok,
+                )
+                if (args.telegram_enabled
+                        and admin_state.get("allow_until", 0.0) > now
+                        and decision.decision == "DENY_UNKNOWN"):
+                    decision = AccessDecision(
+                        decision="ALLOW", reason="admin_override",
+                        identity="admin_override", score=decision.score,
+                        color=(0, 200, 0), display_text="admin_override")
+                color = decision.color
+
+                event_key = (decision.decision, decision.reason, decision.identity)
+                if (event_key != last_logged_key
+                        or (now - last_logged_at) >= args.event_cooldown_sec):
+                    log_access_event(
+                        args.db_path,
+                        AccessEvent(
+                            decision=decision.decision, reason=decision.reason,
+                            identity=decision.identity, score=decision.score,
+                            liveness_ok=liveness_ok, source="camera_verify",
+                            is_suspicious=decision.decision != "ALLOW",
+                        ))
+                    last_logged_key = event_key
+                    last_logged_at = now
+                    if getattr(args, "audit_enabled", True) and decision.decision == "ALLOW":
+                        fixed = mark_recent_false_incidents(
+                            args.db_path, identity=decision.identity,
+                            lookback_sec=getattr(args, "audit_lookback_sec", 20))
+                        if fixed > 0:
+                            self.after(0, self.append_log,
+                                       f"audit: исправлено {fixed} ложных инцидентов")
+
+                if decision.decision.startswith("DENY_"):
+                    deny_events.append(now)
+                    if deny_streak_started_at is None:
+                        deny_streak_started_at = now
+                else:
+                    deny_streak_started_at = None
+                while deny_events and (now - deny_events[0]) > args.telegram_window_sec:
+                    deny_events.popleft()
+
+                if decision.decision == "DENY_UNKNOWN":
+                    if unknown_started_at is None:
+                        unknown_started_at = now
+                else:
+                    unknown_started_at = None
+
+                if decision.decision == "ALLOW" and relay is not None:
+                    relay.open_door()
+
+                draw_box(frame, box, color)
+                text = decision.display_text
+                if args.show_score and decision.score >= 0:
+                    text = f"{decision.display_text} ({decision.score:.3f})"
+                text += status_suffix
+                put_status(frame, text, color)
+
+                self.after(0, self._show_frame, frame.copy())
+
+            cap.release()
+            telegram_stop_event.set()
+            if telegram_cb_thread is not None:
+                telegram_cb_thread.join(timeout=0.5)
+            if relay is not None:
+                relay.cleanup()
+
+            self.after(0, self.append_log, "Верификация остановлена.")
+            self.after(0, self._on_cam_exit, 0)
+        except Exception as exc:
+            self.after(0, self.append_log, f"Ошибка верификации: {exc}")
+            self.after(0, self._on_cam_exit, 1)
 
     # ═══════════════════════════ TAB: СОТРУДНИКИ ══════════════════════════════
     def _build_tab_employees(self) -> None:
@@ -891,7 +1374,7 @@ class FaceIdGui(tk.Tk):
 
     # ═══════════════════════════ ДЕЙСТВИЯ ════════════════════════════════════
     def start_register(self) -> None:
-        if self.proc is not None:
+        if self._busy():
             messagebox.showwarning("Занято", "Сначала остановите текущий процесс.")
             return
         name = self.name_var.get().strip()
@@ -902,16 +1385,29 @@ class FaceIdGui(tk.Tk):
             samples = int(self.samples_var.get().strip())
             if samples < 1:
                 raise ValueError
-            cmd = self._build_base_cmd()
+            camera_index, db_path, weights_path, device = self._validate_common()
         except ValueError as exc:
             messagebox.showerror("Ошибка", str(exc) or "Некорректные параметры.")
             return
-        cmd.extend(["register", "--name", name, "--samples", str(samples)])
-        self._start_process(cmd, "REGISTER", f"Регистрация: {name}")
+        import argparse as _ap
+        args = _ap.Namespace(
+            camera_index=camera_index,
+            db_path=db_path,
+            weights_path=weights_path,
+            device=device,
+            name=name,
+            samples=samples,
+            capture_interval_sec=0.5,
+        )
+        self._cam_stop_event.clear()
+        self._cam_thread = threading.Thread(
+            target=self._run_register_embedded, args=(args,), daemon=True)
+        self._cam_thread.start()
+        self.set_status("REGISTER", f"Регистрация: {name}")
         self.nb.select(0)
 
     def start_verify(self) -> None:
-        if self.proc is not None:
+        if self._busy():
             messagebox.showwarning("Занято", "Сначала остановите текущий процесс.")
             return
         try:
@@ -929,12 +1425,10 @@ class FaceIdGui(tk.Tk):
             tg_alert_cooldown    = float(self.telegram_alert_cooldown_var.get().strip())
             tg_unknown_cooldown  = float(self.telegram_unknown_cooldown_var.get().strip())
             tg_admin_allow_sec   = float(self.telegram_admin_allow_sec_var.get().strip())
-            cmd = self._build_base_cmd()
+            camera_index, db_path, weights_path, device = self._validate_common()
         except ValueError as exc:
             messagebox.showerror("Ошибка", str(exc) or "Некорректные параметры.")
             return
-
-        cmd.extend(["verify", "--threshold", str(threshold)])
 
         anti_spoof_model_raw = self.anti_spoof_model_path_var.get().strip()
         anti_spoof_enabled   = self.anti_spoof_enabled_var.get()
@@ -945,59 +1439,64 @@ class FaceIdGui(tk.Tk):
         elif anti_spoof_enabled and not anti_spoof_model_raw:
             anti_spoof_enabled = False
 
-        if anti_spoof_model_raw:
-            cmd.extend(["--anti-spoof-model-path", anti_spoof_model_raw])
-        if self.show_score_var.get():
-            cmd.append("--show-score")
-        cmd.extend(["--event-ttl-days", str(event_ttl_days)])
-        cmd.extend(["--event-cooldown-sec", str(event_cooldown)])
-        cmd.append("--liveness" if self.liveness_enabled_var.get() else "--no-liveness")
-        cmd.append("--anti-spoof" if anti_spoof_enabled else "--no-anti-spoof")
-        cmd.extend(["--anti-spoof-threshold", str(anti_spoof_threshold)])
-        cmd.extend(["--passive-residual-flow", str(passive_residual)])
-        cmd.extend(["--passive-min-texture", str(passive_texture)])
-        cmd.extend(["--passive-max-face-jitter-px", str(passive_max_jitter)])
-        cmd.append("--relay-enabled" if self.relay_enabled_var.get() else "--no-relay-enabled")
-        cmd.extend(["--relay-pin", str(relay_pin)])
-        cmd.extend(["--relay-duration-sec", str(relay_duration)])
-        cmd.append("--relay-active-high" if self.relay_active_high_var.get()
-                   else "--no-relay-active-high")
-        cmd.append("--telegram-enabled" if self.telegram_enabled_var.get()
-                   else "--no-telegram-enabled")
-        if self.telegram_bot_token_var.get().strip():
-            cmd.extend(["--telegram-bot-token", self.telegram_bot_token_var.get().strip()])
-        if self.telegram_chat_id_var.get().strip():
-            cmd.extend(["--telegram-chat-id", self.telegram_chat_id_var.get().strip()])
-        if self.telegram_chat_id2_var.get().strip():
-            cmd.extend(["--telegram-chat-id2", self.telegram_chat_id2_var.get().strip()])
-        cmd.extend(["--telegram-fail-threshold",    str(tg_fail_threshold)])
-        cmd.extend(["--telegram-window-sec",         str(tg_window)])
-        cmd.extend(["--telegram-alert-cooldown-sec", str(tg_alert_cooldown)])
-        cmd.extend(["--telegram-unknown-cooldown-sec", str(tg_unknown_cooldown)])
-        cmd.append("--telegram-send-photo" if self.telegram_send_photo_var.get()
-                   else "--no-telegram-send-photo")
-        cmd.append("--telegram-admin-buttons" if self.telegram_admin_buttons_var.get()
-                   else "--no-telegram-admin-buttons")
-        cmd.extend(["--telegram-admin-allow-sec", str(tg_admin_allow_sec)])
-
-        if self.threshold_after_hours_var.get():
-            cmd.append("--threshold-after-hours")
-            cmd.extend(["--threshold-night",       self.threshold_night_var.get().strip()])
-            cmd.extend(["--threshold-night-start", self.threshold_night_start_var.get().strip()])
-            cmd.extend(["--threshold-night-end",   self.threshold_night_end_var.get().strip()])
-        else:
-            cmd.append("--no-threshold-after-hours")
-
-        cmd.append("--schedule-enabled" if self.schedule_enabled_var.get()
-                   else "--no-schedule-enabled")
-        cmd.append("--cluster-unknowns" if self.cluster_unknowns_var.get()
-                   else "--no-cluster-unknowns")
-
-        self._start_process(cmd, "VERIFY", "Верификация запущена")
+        import argparse as _ap
+        args = _ap.Namespace(
+            camera_index=camera_index,
+            db_path=db_path,
+            weights_path=weights_path,
+            device=device,
+            threshold=threshold,
+            show_score=self.show_score_var.get(),
+            liveness=self.liveness_enabled_var.get(),
+            anti_spoof=anti_spoof_enabled,
+            anti_spoof_model_path=Path(anti_spoof_model_raw) if anti_spoof_model_raw else Path("artifacts/anti_spoof_model.pt"),
+            anti_spoof_threshold=anti_spoof_threshold,
+            anti_spoof_input_size=128,
+            anti_spoof_margin_ratio=0.20,
+            anti_spoof_min_interval_sec=0.10,
+            liveness_hold_sec=3.0,
+            passive_window_sec=0.6,
+            passive_residual_flow=passive_residual,
+            passive_min_texture=passive_texture,
+            passive_max_face_jitter_px=passive_max_jitter,
+            event_ttl_days=event_ttl_days,
+            event_cooldown_sec=event_cooldown,
+            relay_enabled=self.relay_enabled_var.get(),
+            relay_pin=relay_pin,
+            relay_duration_sec=relay_duration,
+            relay_active_high=self.relay_active_high_var.get(),
+            telegram_enabled=self.telegram_enabled_var.get(),
+            telegram_bot_token=self.telegram_bot_token_var.get().strip(),
+            telegram_chat_id=self.telegram_chat_id_var.get().strip(),
+            telegram_chat_id2=self.telegram_chat_id2_var.get().strip(),
+            telegram_fail_threshold=tg_fail_threshold,
+            telegram_window_sec=tg_window,
+            telegram_alert_cooldown_sec=tg_alert_cooldown,
+            telegram_unknown_cooldown_sec=tg_unknown_cooldown,
+            telegram_send_photo=self.telegram_send_photo_var.get(),
+            telegram_admin_buttons=self.telegram_admin_buttons_var.get(),
+            telegram_admin_allow_sec=tg_admin_allow_sec,
+            telegram_suspicious_min_presence_sec=3.5,
+            telegram_unknown_min_presence_sec=2.5,
+            threshold_after_hours=self.threshold_after_hours_var.get(),
+            threshold_night=float(self.threshold_night_var.get().strip() or "0.82"),
+            threshold_night_start=int(self.threshold_night_start_var.get().strip() or "20"),
+            threshold_night_end=int(self.threshold_night_end_var.get().strip() or "8"),
+            schedule_enabled=self.schedule_enabled_var.get(),
+            cluster_unknowns=self.cluster_unknowns_var.get(),
+            cluster_unknowns_cooldown_sec=5.0,
+            audit_enabled=True,
+            audit_lookback_sec=20,
+        )
+        self._cam_stop_event.clear()
+        self._cam_thread = threading.Thread(
+            target=self._run_verify_embedded, args=(args,), daemon=True)
+        self._cam_thread.start()
+        self.set_status("VERIFY", "Верификация запущена")
         self.nb.select(0)
 
     def download_weights(self) -> None:
-        if self.proc is not None:
+        if self._busy():
             messagebox.showwarning("Занято", "Сначала остановите процесс.")
             return
         self._start_process([sys.executable, "download_weights.py"],
@@ -1036,7 +1535,7 @@ class FaceIdGui(tk.Tk):
         self.after(0, self.set_status, "TELEGRAM", f"Telegram: тест отправлен")
 
     def start_capture(self) -> None:
-        if self.proc is not None:
+        if self._busy():
             messagebox.showwarning("Занято", "Сначала остановите текущий процесс.")
             return
         label  = self.capture_label_var.get().strip()
@@ -1063,7 +1562,7 @@ class FaceIdGui(tk.Tk):
         self._start_process(cmd, "CAPTURE", f"Захват: {label_ru}")
 
     def start_train_model(self) -> None:
-        if self.proc is not None:
+        if self._busy():
             messagebox.showwarning("Занято", "Сначала остановите текущий процесс.")
             return
         dataset_dir = self.model_dataset_dir_var.get().strip() or "dataset/anti_spoof"
@@ -1146,11 +1645,16 @@ class FaceIdGui(tk.Tk):
             self.set_status("ERROR", f"Ошибка (код {exit_code})")
 
     def stop_process(self) -> None:
-        if self.proc is None:
-            return
-        self.proc.terminate()
-        self.append_log("[запрошена остановка]")
-        self.set_status("STOPPING", "Остановка...")
+        stopped = False
+        if self.proc is not None:
+            self.proc.terminate()
+            stopped = True
+        if self._cam_thread is not None and self._cam_thread.is_alive():
+            self._cam_stop_event.set()
+            stopped = True
+        if stopped:
+            self.append_log("[запрошена остановка]")
+            self.set_status("STOPPING", "Остановка...")
 
     # ═══════════════════════ ОБНОВЛЕНИЕ ДАННЫХ ════════════════════════════════
     def _refresh_events(self) -> None:
@@ -1842,6 +2346,7 @@ class FaceIdGui(tk.Tk):
         self._save_config()
         if self.proc is not None:
             self.proc.terminate()
+        self._cam_stop_event.set()
         self.destroy()
 
 
